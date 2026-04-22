@@ -1,6 +1,7 @@
 mod app;
 mod events;
 mod parser;
+mod retained;
 mod ui;
 
 use anyhow::Result;
@@ -44,25 +45,155 @@ fn main() -> Result<()> {
         println!("Histogram : {} entries", analysis.class_histogram.len());
         println!("Suspects  : {}", analysis.leak_suspects.len());
         println!("Dup str   : {}", analysis.duplicate_strings.len());
-        println!("\nTop 5 classes:");
-        for (i, c) in analysis.class_histogram.iter().take(5).enumerate() {
+        let heap_nz = s.total_heap_size.max(1);
+        println!("\nTop 30 classes by shallow size:");
+        println!(
+            "  {:>3}  {:<55} {:>10}  {:>10}  {:>7}",
+            "#", "Class", "ShallowSz", "Instances", "% Heap"
+        );
+        println!(
+            "  {}  {}  {}  {}  {}",
+            "-".repeat(3),
+            "-".repeat(55),
+            "-".repeat(10),
+            "-".repeat(10),
+            "-".repeat(7)
+        );
+        for (i, c) in analysis.class_histogram.iter().take(30).enumerate() {
+            let pct = c.shallow_size as f64 / heap_nz as f64 * 100.0;
             println!(
-                "  {:2}. {:<50} {:>8}  x{}",
+                "  {:>3}  {:<55} {:>10}  {:>10}  {:>6.2}%",
                 i + 1,
-                c.class_name,
+                if c.class_name.len() > 55 {
+                    format!("…{}", &c.class_name[c.class_name.len() - 54..])
+                } else {
+                    c.class_name.clone()
+                },
                 parser::fmt_bytes(c.shallow_size),
-                c.instance_count
+                c.instance_count,
+                pct
             );
         }
-        if !analysis.leak_suspects.is_empty() {
-            println!("\nLeak suspects:");
-            for ls in analysis.leak_suspects.iter().take(5) {
+        // Lower threshold: show all classes >1% of heap
+        let suspects: Vec<_> = analysis
+            .class_histogram
+            .iter()
+            .filter(|c| (c.shallow_size as f64 / heap_nz as f64 * 100.0) >= 1.0)
+            .collect();
+        println!("\nClasses using >1% of heap ({} found):", suspects.len());
+        for c in &suspects {
+            let pct = c.shallow_size as f64 / heap_nz as f64 * 100.0;
+            let sev = if pct >= 30.0 {
+                "HIGH"
+            } else if pct >= 15.0 {
+                "MED "
+            } else if pct >= 5.0 {
+                "LOW "
+            } else {
+                "    "
+            };
+            println!(
+                "  [{}] {:>6.2}%  {:>10}  x{:<8}  {}",
+                sev,
+                pct,
+                parser::fmt_bytes(c.shallow_size),
+                c.instance_count,
+                c.class_name
+            );
+        }
+        // Oracle/vendor specific classes
+        let vendor: Vec<_> = analysis
+            .class_histogram
+            .iter()
+            .filter(|c| {
+                c.class_name.contains("oracle")
+                    || c.class_name.contains("jdbc")
+                    || c.class_name.contains("hibernate")
+                    || c.class_name.contains("spring")
+                    || c.class_name.contains("tomcat")
+                    || c.class_name.contains("netty")
+                    || c.class_name.contains("apache")
+            })
+            .take(15)
+            .collect();
+        if !vendor.is_empty() {
+            println!("\nTop vendor/framework classes:");
+            for c in &vendor {
+                let pct = c.shallow_size as f64 / heap_nz as f64 * 100.0;
                 println!(
-                    "  [{}] {:.1}%  {}",
-                    ls.severity.label(),
-                    ls.heap_percentage,
-                    ls.class_name
+                    "  {:>6.2}%  {:>10}  x{:<8}  {}",
+                    pct,
+                    parser::fmt_bytes(c.shallow_size),
+                    c.instance_count,
+                    c.class_name
                 );
+            }
+        }
+        // Also run retained analysis in dump mode
+        if std::env::var("HPROF_RETAINED").is_ok() {
+            eprintln!("Computing retained sizes (this may take a while)...");
+            match crate::retained::compute_retained(&cli.hprof_file) {
+                Ok(ra) => {
+                    println!(
+                        "\n=== Retained Size Analysis ({} classes{}) ===",
+                        ra.entries.len(),
+                        if ra.truncated { ", TRUNCATED" } else { "" }
+                    );
+                    println!(
+                        "{:>3}  {:<52} {:>11}  {:>11}  {:>7}  {:>8}",
+                        "#", "Class", "Retained", "Shallow", "×Over", "%Heap"
+                    );
+                    println!(
+                        "{}  {}  {}  {}  {}  {}",
+                        "-".repeat(3),
+                        "-".repeat(52),
+                        "-".repeat(11),
+                        "-".repeat(11),
+                        "-".repeat(5),
+                        "-".repeat(8)
+                    );
+                    let heap = ra
+                        .entries
+                        .iter()
+                        .map(|e| e.shallow_size)
+                        .sum::<u64>()
+                        .max(1);
+                    for (i, e) in ra.entries.iter().take(25).enumerate() {
+                        let pct = e.retained_size as f64 / heap as f64 * 100.0;
+                        let name = if e.class_name.len() > 52 {
+                            format!("…{}", &e.class_name[e.class_name.len() - 51..])
+                        } else {
+                            e.class_name.clone()
+                        };
+                        println!(
+                            "{:>3}  {:<52} {:>11}  {:>11}  {:>5.1}×  {:>7.2}%",
+                            i + 1,
+                            name,
+                            parser::fmt_bytes(e.retained_size),
+                            parser::fmt_bytes(e.shallow_size),
+                            e.overhead_ratio,
+                            pct
+                        );
+                        if !e.top_contributors.is_empty() {
+                            for c in e.top_contributors.iter().take(3) {
+                                let c_pct = c.total_bytes as f64 / e.retained_size as f64 * 100.0;
+                                let cname = if c.class_name.len() > 48 {
+                                    format!("…{}", &c.class_name[c.class_name.len() - 47..])
+                                } else {
+                                    c.class_name.clone()
+                                };
+                                println!(
+                                    "         ↳  {:<48} {:>11}  {:.1}%  ×{}",
+                                    cname,
+                                    parser::fmt_bytes(c.total_bytes),
+                                    c_pct,
+                                    c.object_count
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Retained analysis error: {}", e),
             }
         }
         return Ok(());

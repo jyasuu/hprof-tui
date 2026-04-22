@@ -8,8 +8,9 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, Tab};
+use crate::app::{App, RetainedState, Tab};
 use crate::parser::fmt_bytes;
+use crate::retained::RetainedClassEntry;
 
 // ── Colour palette ──────────────────────────────────────────────────────────
 const C_BG: Color = Color::Rgb(15, 17, 26);
@@ -117,10 +118,9 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let shortcut = format!("{}", i + 1);
-            if i < 5 {
+            if i < 6 {
                 Line::from(vec![
-                    Span::styled(format!("[{}]", shortcut), dim()),
+                    Span::styled(format!("[{}]", i + 1), dim()),
                     Span::raw(" "),
                     Span::raw(t.title()),
                 ])
@@ -151,6 +151,7 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect) {
     match app.active_tab {
         Tab::Overview => draw_overview(f, app, area),
         Tab::Histogram => draw_histogram(f, app, area),
+        Tab::RetainedGraph => draw_retained(f, app, area),
         Tab::LeakSuspects => draw_leak_suspects(f, app, area),
         Tab::GcRoots => draw_gc_roots(f, app, area),
         Tab::DuplicateStrings => draw_dup_strings(f, app, area),
@@ -169,14 +170,18 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled(" q", Style::default().fg(C_ACCENT)),
             Span::styled("/Ctrl-C quit  ", dim()),
-            Span::styled("Tab", Style::default().fg(C_ACCENT)),
-            Span::styled("/←→ switch tab  ", dim()),
+            Span::styled("Tab/←→", Style::default().fg(C_ACCENT)),
+            Span::styled(" switch tab  ", dim()),
+            Span::styled("1-6", Style::default().fg(C_ACCENT)),
+            Span::styled(" jump tab  ", dim()),
+            Span::styled("3", Style::default().fg(C_ACCENT)),
+            Span::styled(" retained sizes  ", dim()),
             Span::styled("↑↓/jk", Style::default().fg(C_ACCENT)),
             Span::styled(" scroll  ", dim()),
             Span::styled("s", Style::default().fg(C_ACCENT)),
-            Span::styled(" toggle sort  ", dim()),
+            Span::styled(" sort  ", dim()),
             Span::styled("g/G", Style::default().fg(C_ACCENT)),
-            Span::styled(" top/bottom  ", dim()),
+            Span::styled(" top/btm  ", dim()),
             Span::styled("?", Style::default().fg(C_ACCENT)),
             Span::styled(" help", dim()),
         ])
@@ -835,14 +840,18 @@ fn draw_help(f: &mut Frame, area: Rect) {
             Style::default().fg(C_ACCENT2).add_modifier(Modifier::BOLD),
         )]),
         help_row("1 Overview", "Heap summary stats + top classes bar chart"),
-        help_row("2 Histogram", "All classes sorted by size or count"),
+        help_row("2 Histogram", "All classes sorted by shallow size or count"),
         help_row(
-            "3 Leak Suspects",
+            "3 Retained/Graph",
+            "Retained sizes + heap ingredient breakdown per class",
+        ),
+        help_row(
+            "4 Leak Suspects",
             "Classes retaining >5% of heap, with severity",
         ),
-        help_row("4 GC Roots", "GC root object summary by type"),
+        help_row("5 GC Roots", "GC root object summary by type"),
         help_row(
-            "5 Dup Strings",
+            "6 Dup Strings",
             "Duplicate java.lang.String instances wasting heap",
         ),
         Line::from(""),
@@ -982,4 +991,310 @@ fn leak_tip(class_name: &str) -> String {
             class_name
         )
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TAB 3: Retained Size / Object Graph
+// ────────────────────────────────────────────────────────────────────────────
+pub fn draw_retained(f: &mut Frame, app: &App, area: Rect) {
+    match &app.retained_state {
+        RetainedState::NotStarted => {
+            let para = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  Press ", dim()),
+                    Span::styled("3", Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)),
+                    Span::styled(" or ", dim()),
+                    Span::styled("Enter", Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)),
+                    Span::styled(" to compute retained sizes.", dim()),
+                ]),
+                Line::from(""),
+                Line::from(vec![Span::styled("  This builds the full object reference graph and may take", dim())]),
+                Line::from(vec![Span::styled("  20-120 seconds for large (1+ GB) heap dumps.", dim())]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  Retained size ", Style::default().fg(C_ACCENT2).add_modifier(Modifier::BOLD)),
+                    Span::styled("= shallow size of an object + everything it exclusively keeps alive.", dim()),
+                ]),
+                Line::from(vec![
+                    Span::styled("  e.g. String shallow=32B but retained=~90B because it owns a char[] backing array.", dim()),
+                ]),
+            ])
+            .block(panel_block("Retained Size & Object Graph  [press 3 or Enter to compute]"))
+            .wrap(Wrap { trim: false });
+            f.render_widget(para, area);
+        }
+
+        RetainedState::Computing => {
+            let para = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "  ⟳  Computing retained sizes… ",
+                    Style::default().fg(C_WARN).add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "  Building object reference graph + BFS retained-size propagation.",
+                    dim(),
+                )]),
+                Line::from(vec![Span::styled("  Please wait — do not quit.", dim())]),
+            ])
+            .block(panel_block("Retained Size & Object Graph"))
+            .wrap(Wrap { trim: false });
+            f.render_widget(para, area);
+        }
+
+        RetainedState::Error(ref msg) => {
+            let para = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    format!("  ✗ Error: {}", msg),
+                    Style::default().fg(C_DANGER),
+                )]),
+                Line::from(""),
+                Line::from(vec![Span::styled("  Press Enter to retry.", dim())]),
+            ])
+            .block(panel_block("Retained Size & Object Graph"))
+            .wrap(Wrap { trim: false });
+            f.render_widget(para, area);
+        }
+
+        RetainedState::Done(ref ra) => {
+            draw_retained_done(f, app, area, ra);
+        }
+    }
+}
+
+fn draw_retained_done(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    ra: &crate::retained::RetainedAnalysis,
+) {
+    // Layout: top table | bottom detail pane
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(12)])
+        .split(area);
+
+    let entries = &ra.entries;
+    let total_heap = app.analysis.summary.total_heap_size.max(1);
+
+    // ── Top: retained class table ────────────────────────────────────────────
+    let header_cells = [
+        "#",
+        "Class",
+        "Instances",
+        "Shallow",
+        "Retained",
+        "×Overhead",
+        "% Heap (ret)",
+    ]
+    .iter()
+    .map(|h| Cell::from(*h).style(header_style()));
+    let header = Row::new(header_cells)
+        .height(1)
+        .style(Style::default().bg(C_PANEL));
+
+    let visible = chunks[0].height.saturating_sub(5) as usize;
+    let scroll = app.retained_scroll;
+
+    let rows: Vec<Row> = entries
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible)
+        .map(|(i, e)| {
+            let is_sel = i == app.retained_selected;
+            let pct_ret = e.retained_size as f64 / total_heap as f64 * 100.0;
+            let row_s = if is_sel { sel_style() } else { style() };
+            let ret_s = if is_sel {
+                sel_style()
+            } else if pct_ret > 10.0 {
+                Style::default().fg(C_DANGER)
+            } else if pct_ret > 3.0 {
+                Style::default().fg(C_WARN)
+            } else {
+                Style::default().fg(C_ACCENT)
+            };
+            let oh_s = if is_sel {
+                sel_style()
+            } else if e.overhead_ratio > 5.0 {
+                Style::default().fg(C_WARN)
+            } else {
+                dim()
+            };
+
+            Row::new(vec![
+                Cell::from(format!("{}", i + 1)).style(dim()),
+                Cell::from(shorten_class(&e.class_name, 45)).style(row_s),
+                Cell::from(fmt_u64(e.instance_count)).style(row_s),
+                Cell::from(fmt_bytes(e.shallow_size)).style(row_s),
+                Cell::from(fmt_bytes(e.retained_size)).style(ret_s),
+                Cell::from(format!("{:.1}×", e.overhead_ratio)).style(oh_s),
+                Cell::from(format!("{:.2}%", pct_ret)).style(ret_s),
+            ])
+            .height(1)
+            .style(row_s)
+        })
+        .collect();
+
+    let trunc_note = if ra.truncated {
+        " [capped at 5M objects]"
+    } else {
+        ""
+    };
+    let scroll_info = format!(
+        " {}/{}{} ",
+        app.retained_selected + 1,
+        entries.len(),
+        trunc_note
+    );
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(5),
+            Constraint::Min(30),
+            Constraint::Length(11),
+            Constraint::Length(11),
+            Constraint::Length(11),
+            Constraint::Length(10),
+            Constraint::Length(13),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(C_BORDER))
+            .style(Style::default().bg(C_PANEL))
+            .title(Span::styled(
+                " Retained Size (sorted by retained) ",
+                accent(),
+            ))
+            .title_alignment(Alignment::Left),
+    )
+    .column_spacing(1);
+    f.render_widget(table, chunks[0]);
+
+    // Scroll info as a separate paragraph below the block
+    let si = Paragraph::new(Span::styled(scroll_info, dim()));
+    let si_area = Rect {
+        x: chunks[0].x + 2,
+        y: chunks[0].y + chunks[0].height - 1,
+        width: 40,
+        height: 1,
+    };
+    f.render_widget(si, si_area);
+
+    // ── Bottom: ingredient detail for selected class ──────────────────────────
+    let detail_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_BORDER))
+        .style(Style::default().bg(C_PANEL))
+        .title(Span::styled(
+            " Heap Ingredients — what makes up the retained size ",
+            accent(),
+        ));
+
+    if let Some(e) = entries.get(app.retained_selected) {
+        let pct_ret = e.retained_size as f64 / total_heap as f64 * 100.0;
+        let pct_own = if e.retained_size > 0 {
+            e.shallow_size as f64 / e.retained_size as f64 * 100.0
+        } else {
+            100.0
+        };
+
+        let mut lines: Vec<Line> = vec![
+            // Header row
+            Line::from(vec![
+                Span::styled(
+                    format!("  {}", e.class_name),
+                    Style::default().fg(C_ACCENT2).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  ×{} instances", fmt_u64(e.instance_count)), dim()),
+            ]),
+            Line::from(vec![
+                Span::styled("  Shallow: ", dim()),
+                Span::styled(fmt_bytes(e.shallow_size), accent()),
+                Span::styled("  │  Retained: ", dim()),
+                Span::styled(
+                    fmt_bytes(e.retained_size),
+                    Style::default().fg(C_ACCENT2).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  ({:.2}% of heap)  │  Overhead: ", pct_ret), dim()),
+                Span::styled(
+                    format!("{:.1}×", e.overhead_ratio),
+                    if e.overhead_ratio > 5.0 {
+                        Style::default().fg(C_WARN)
+                    } else {
+                        Style::default().fg(C_LOW)
+                    },
+                ),
+                Span::styled(format!("  │  Avg per instance: ",), dim()),
+                Span::styled(fmt_bytes(e.avg_retained), accent()),
+            ]),
+            Line::from(vec![Span::styled("  ─".repeat(60), dim())]),
+        ];
+
+        // Self contribution bar
+        let self_bar = make_bar(pct_own as u32, 30);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<42}", "self (own fields)"),
+                Style::default().fg(C_ACCENT),
+            ),
+            Span::styled(format!(" {:>11}", fmt_bytes(e.shallow_size)), accent()),
+            Span::styled(format!("  {}", self_bar), Style::default().fg(C_ACCENT)),
+            Span::styled(format!(" {:.1}%", pct_own), dim()),
+        ]));
+
+        // Contributor bars
+        for c in e.top_contributors.iter().take(5) {
+            let c_pct = if e.retained_size > 0 {
+                c.total_bytes as f64 / e.retained_size as f64 * 100.0
+            } else {
+                0.0
+            };
+            let bar = make_bar(c_pct as u32, 30);
+            let name = shorten_class(&c.class_name, 42);
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<42}", name), Style::default().fg(C_TEXT)),
+                Span::styled(
+                    format!(" {:>11}", fmt_bytes(c.total_bytes)),
+                    Style::default().fg(C_ACCENT2),
+                ),
+                Span::styled(format!("  {}", bar), Style::default().fg(C_ACCENT2)),
+                Span::styled(
+                    format!(" {:.1}%  ×{}", c_pct, fmt_u64(c.object_count)),
+                    dim(),
+                ),
+            ]));
+        }
+
+        if e.top_contributors.is_empty() {
+            lines.push(Line::from(vec![Span::styled(
+                "  (no exclusively-owned children — all references are shared)",
+                dim(),
+            )]));
+        }
+
+        let para = Paragraph::new(lines)
+            .block(detail_block)
+            .wrap(Wrap { trim: false });
+        f.render_widget(para, chunks[1]);
+    } else {
+        let para = Paragraph::new("  No entry selected.")
+            .style(dim())
+            .block(detail_block);
+        f.render_widget(para, chunks[1]);
+    }
+}
+
+fn make_bar(pct: u32, width: usize) -> String {
+    let filled = (pct as usize * width / 100).min(width);
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }

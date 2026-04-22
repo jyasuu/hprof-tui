@@ -1,10 +1,12 @@
 use crate::parser::{analyze_hprof, HprofAnalysis};
+use crate::retained::{RetainedAnalysis, RetainedClassEntry};
 use anyhow::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Tab {
     Overview,
     Histogram,
+    RetainedGraph,
     LeakSuspects,
     GcRoots,
     DuplicateStrings,
@@ -15,6 +17,7 @@ impl Tab {
     pub const ALL: &'static [Tab] = &[
         Tab::Overview,
         Tab::Histogram,
+        Tab::RetainedGraph,
         Tab::LeakSuspects,
         Tab::GcRoots,
         Tab::DuplicateStrings,
@@ -25,6 +28,7 @@ impl Tab {
         match self {
             Tab::Overview => "Overview",
             Tab::Histogram => "Histogram",
+            Tab::RetainedGraph => "Retained/Graph",
             Tab::LeakSuspects => "Leak Suspects",
             Tab::GcRoots => "GC Roots",
             Tab::DuplicateStrings => "Dup Strings",
@@ -37,19 +41,33 @@ impl Tab {
     }
 }
 
+pub enum RetainedState {
+    NotStarted,
+    Computing,
+    Done(RetainedAnalysis),
+    Error(String),
+}
+
 pub struct App {
     pub analysis: HprofAnalysis,
     pub active_tab: Tab,
+    pub retained_state: RetainedState,
+
+    // per-tab scroll/selection
     pub histogram_scroll: usize,
     pub histogram_selected: usize,
+    pub retained_scroll: usize,
+    pub retained_selected: usize,
     pub leak_scroll: usize,
     pub leak_selected: usize,
     pub gc_scroll: usize,
     pub gc_selected: usize,
     pub dup_scroll: usize,
     pub dup_selected: usize,
-    pub sort_by_count: bool, // false = sort by size
+
+    pub sort_by_count: bool,
     pub status_message: Option<String>,
+    pub hprof_path: String,
 }
 
 impl App {
@@ -58,8 +76,11 @@ impl App {
         Ok(App {
             analysis,
             active_tab: Tab::Overview,
+            retained_state: RetainedState::NotStarted,
             histogram_scroll: 0,
             histogram_selected: 0,
+            retained_scroll: 0,
+            retained_selected: 0,
             leak_scroll: 0,
             leak_selected: 0,
             gc_scroll: 0,
@@ -68,6 +89,7 @@ impl App {
             dup_selected: 0,
             sort_by_count: false,
             status_message: None,
+            hprof_path: path.to_string(),
         })
     }
 
@@ -83,42 +105,30 @@ impl App {
 
     pub fn scroll_down(&mut self) {
         match self.active_tab {
-            Tab::Histogram => {
-                let max = self.analysis.class_histogram.len().saturating_sub(1);
-                if self.histogram_selected < max {
-                    self.histogram_selected += 1;
-                    if self.histogram_selected >= self.histogram_scroll + visible_rows() {
-                        self.histogram_scroll += 1;
-                    }
-                }
+            Tab::Histogram => scroll_sel(
+                &mut self.histogram_selected,
+                &mut self.histogram_scroll,
+                self.analysis.class_histogram.len(),
+            ),
+            Tab::RetainedGraph => {
+                let len = retained_len(&self.retained_state);
+                scroll_sel(&mut self.retained_selected, &mut self.retained_scroll, len);
             }
-            Tab::LeakSuspects => {
-                let max = self.analysis.leak_suspects.len().saturating_sub(1);
-                if self.leak_selected < max {
-                    self.leak_selected += 1;
-                    if self.leak_selected >= self.leak_scroll + visible_rows() {
-                        self.leak_scroll += 1;
-                    }
-                }
-            }
-            Tab::GcRoots => {
-                let max = self.analysis.gc_roots.len().saturating_sub(1);
-                if self.gc_selected < max {
-                    self.gc_selected += 1;
-                    if self.gc_selected >= self.gc_scroll + visible_rows() {
-                        self.gc_scroll += 1;
-                    }
-                }
-            }
-            Tab::DuplicateStrings => {
-                let max = self.analysis.duplicate_strings.len().saturating_sub(1);
-                if self.dup_selected < max {
-                    self.dup_selected += 1;
-                    if self.dup_selected >= self.dup_scroll + visible_rows() {
-                        self.dup_scroll += 1;
-                    }
-                }
-            }
+            Tab::LeakSuspects => scroll_sel(
+                &mut self.leak_selected,
+                &mut self.leak_scroll,
+                self.analysis.leak_suspects.len(),
+            ),
+            Tab::GcRoots => scroll_sel(
+                &mut self.gc_selected,
+                &mut self.gc_scroll,
+                self.analysis.gc_roots.len(),
+            ),
+            Tab::DuplicateStrings => scroll_sel(
+                &mut self.dup_selected,
+                &mut self.dup_scroll,
+                self.analysis.duplicate_strings.len(),
+            ),
             _ => {}
         }
     }
@@ -126,49 +136,25 @@ impl App {
     pub fn scroll_up(&mut self) {
         match self.active_tab {
             Tab::Histogram => {
-                if self.histogram_selected > 0 {
-                    self.histogram_selected -= 1;
-                    if self.histogram_selected < self.histogram_scroll {
-                        self.histogram_scroll = self.histogram_selected;
-                    }
-                }
+                scroll_up_sel(&mut self.histogram_selected, &mut self.histogram_scroll)
             }
-            Tab::LeakSuspects => {
-                if self.leak_selected > 0 {
-                    self.leak_selected -= 1;
-                    if self.leak_selected < self.leak_scroll {
-                        self.leak_scroll = self.leak_selected;
-                    }
-                }
+            Tab::RetainedGraph => {
+                scroll_up_sel(&mut self.retained_selected, &mut self.retained_scroll)
             }
-            Tab::GcRoots => {
-                if self.gc_selected > 0 {
-                    self.gc_selected -= 1;
-                    if self.gc_selected < self.gc_scroll {
-                        self.gc_scroll = self.gc_selected;
-                    }
-                }
-            }
-            Tab::DuplicateStrings => {
-                if self.dup_selected > 0 {
-                    self.dup_selected -= 1;
-                    if self.dup_selected < self.dup_scroll {
-                        self.dup_scroll = self.dup_selected;
-                    }
-                }
-            }
+            Tab::LeakSuspects => scroll_up_sel(&mut self.leak_selected, &mut self.leak_scroll),
+            Tab::GcRoots => scroll_up_sel(&mut self.gc_selected, &mut self.gc_scroll),
+            Tab::DuplicateStrings => scroll_up_sel(&mut self.dup_selected, &mut self.dup_scroll),
             _ => {}
         }
     }
 
     pub fn page_down(&mut self) {
-        for _ in 0..10 {
+        for _ in 0..15 {
             self.scroll_down();
         }
     }
-
     pub fn page_up(&mut self) {
-        for _ in 0..10 {
+        for _ in 0..15 {
             self.scroll_up();
         }
     }
@@ -178,6 +164,10 @@ impl App {
             Tab::Histogram => {
                 self.histogram_selected = 0;
                 self.histogram_scroll = 0;
+            }
+            Tab::RetainedGraph => {
+                self.retained_selected = 0;
+                self.retained_scroll = 0;
             }
             Tab::LeakSuspects => {
                 self.leak_selected = 0;
@@ -200,22 +190,27 @@ impl App {
             Tab::Histogram => {
                 let n = self.analysis.class_histogram.len().saturating_sub(1);
                 self.histogram_selected = n;
-                self.histogram_scroll = n.saturating_sub(visible_rows() - 1);
+                self.histogram_scroll = n.saturating_sub(VISIBLE - 1);
+            }
+            Tab::RetainedGraph => {
+                let n = retained_len(&self.retained_state).saturating_sub(1);
+                self.retained_selected = n;
+                self.retained_scroll = n.saturating_sub(VISIBLE - 1);
             }
             Tab::LeakSuspects => {
                 let n = self.analysis.leak_suspects.len().saturating_sub(1);
                 self.leak_selected = n;
-                self.leak_scroll = n.saturating_sub(visible_rows() - 1);
+                self.leak_scroll = n.saturating_sub(VISIBLE - 1);
             }
             Tab::GcRoots => {
                 let n = self.analysis.gc_roots.len().saturating_sub(1);
                 self.gc_selected = n;
-                self.gc_scroll = n.saturating_sub(visible_rows() - 1);
+                self.gc_scroll = n.saturating_sub(VISIBLE - 1);
             }
             Tab::DuplicateStrings => {
                 let n = self.analysis.duplicate_strings.len().saturating_sub(1);
                 self.dup_selected = n;
-                self.dup_scroll = n.saturating_sub(visible_rows() - 1);
+                self.dup_scroll = n.saturating_sub(VISIBLE - 1);
             }
             _ => {}
         }
@@ -227,19 +222,54 @@ impl App {
             self.analysis
                 .class_histogram
                 .sort_by(|a, b| b.instance_count.cmp(&a.instance_count));
-            self.status_message = Some("Sorted by instance count".to_string());
+            self.status_message = Some("Histogram sorted by instance count".to_string());
         } else {
             self.analysis
                 .class_histogram
                 .sort_by(|a, b| b.shallow_size.cmp(&a.shallow_size));
-            self.status_message = Some("Sorted by shallow size".to_string());
+            self.status_message = Some("Histogram sorted by shallow size".to_string());
         }
         self.histogram_selected = 0;
         self.histogram_scroll = 0;
     }
+
+    /// Returns the currently selected RetainedClassEntry if available
+    pub fn selected_retained(&self) -> Option<&RetainedClassEntry> {
+        if let RetainedState::Done(ref ra) = self.retained_state {
+            ra.entries.get(self.retained_selected)
+        } else {
+            None
+        }
+    }
 }
 
-fn visible_rows() -> usize {
-    20 // approximate; real value would come from terminal size
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+const VISIBLE: usize = 20;
+
+fn scroll_sel(selected: &mut usize, scroll: &mut usize, len: usize) {
+    let max = len.saturating_sub(1);
+    if *selected < max {
+        *selected += 1;
+        if *selected >= *scroll + VISIBLE {
+            *scroll += 1;
+        }
+    }
 }
-// --- additional methods appended ---
+
+fn scroll_up_sel(selected: &mut usize, scroll: &mut usize) {
+    if *selected > 0 {
+        *selected -= 1;
+        if *selected < *scroll {
+            *scroll = *selected;
+        }
+    }
+}
+
+fn retained_len(state: &RetainedState) -> usize {
+    if let RetainedState::Done(ref ra) = state {
+        ra.entries.len()
+    } else {
+        0
+    }
+}
