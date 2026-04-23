@@ -1,6 +1,6 @@
 //! TUI rendering — 7 tabs driven by HeapLens HeapAnalysis trait data.
 
-use crate::app::{shorten, App, Tab};
+use crate::app::{shorten, App, Tab, VISIBLE};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -277,25 +277,50 @@ fn tab_overview(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(List::new(badges).block(panel("Issues")), left[1]);
 
     // Right: bar chart by retained size
-    let max_ret = hist.first().map(|e| e.retained_size).unwrap_or(1).max(1);
+    // Use reachable heap as bar scale ceiling — cap abnormal retained values
+    let reachable = s.reachable_heap_size.max(1);
+    // Scale bars against the second-largest non-abnormal class for readability
+    let normal_max = hist
+        .iter()
+        .map(|e| e.retained_size.min(reachable))
+        .max()
+        .unwrap_or(1)
+        .max(1);
     let inner_h = cols[1].height.saturating_sub(2) as usize;
     let max_bars = (inner_h / 2).min(15).min(hist.len());
-    let bar_w = (cols[1].width.saturating_sub(14) as usize).min(50);
+    let bar_w = (cols[1].width.saturating_sub(16) as usize).min(48);
     let mut lines: Vec<Line> = Vec::new();
     for (i, e) in hist.iter().take(max_bars).enumerate() {
-        let pct = (e.retained_size as f64 / max_ret as f64 * 100.0) as u16;
-        let col = if i == 0 {
+        let abnormal = e.retained_size > reachable;
+        let capped = e.retained_size.min(reachable);
+        let bar_pct = (capped as f64 / normal_max as f64 * 100.0) as u16;
+        let heap_pct = e.retained_size as f64 / reachable as f64 * 100.0;
+        let col = if abnormal {
+            DANGER
+        } else if i == 0 {
             DANGER
         } else if i < 3 {
             WARN
         } else {
             ACCENT
         };
-        let filled = (pct as usize * bar_w / 100).min(bar_w);
+        let filled = (bar_pct as usize * bar_w / 100).min(bar_w);
+        let pct_label = if abnormal {
+            "⚠>100%".to_string()
+        } else {
+            format!("{:.1}%", heap_pct)
+        };
         lines.push(Line::from(vec![
             Span::styled(format!(" {:>2}. ", i + 1), Style::default().fg(col)),
-            Span::styled(format!("{:<38}", shorten(&e.class_name, 38)), sty()),
-            Span::styled(format!(" {:>10}", fmt_bytes(e.retained_size)), acc()),
+            Span::styled(format!("{:<36}", shorten(&e.class_name, 36)), sty()),
+            Span::styled(
+                format!(" {:>10}", fmt_bytes(e.retained_size)),
+                if abnormal {
+                    Style::default().fg(DANGER)
+                } else {
+                    acc()
+                },
+            ),
         ]));
         lines.push(Line::from(vec![
             Span::raw("      "),
@@ -303,8 +328,41 @@ fn tab_overview(f: &mut Frame, app: &App, area: Rect) {
                 "█".repeat(filled) + &"░".repeat(bar_w - filled),
                 Style::default().fg(col),
             ),
-            Span::styled(format!(" {:>3}%", pct), dim()),
+            Span::styled(
+                format!(" {}", pct_label),
+                if abnormal {
+                    Style::default().fg(DANGER)
+                } else {
+                    dim()
+                },
+            ),
         ]));
+    }
+    // Append note about ⚠ if any class has retained > heap
+    let has_abnormal = hist
+        .iter()
+        .take(max_bars)
+        .any(|e| e.retained_size > app.state.get_summary().total_heap_size);
+    if has_abnormal {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  ⚠ ",
+                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Retained > heap = double-counting artifact.",
+                Style::default().fg(WARN),
+            ),
+            Span::styled(
+                " Summing per-instance retained sizes overcounts shared subgraphs.",
+                dim(),
+            ),
+        ]));
+        lines.push(Line::from(vec![Span::styled(
+            "    Use tab [6] Dominator Tree to drill into individual objects.",
+            dim(),
+        )]));
     }
     f.render_widget(
         Paragraph::new(lines)
@@ -337,16 +395,21 @@ fn tab_histogram(f: &mut Frame, app: &App, area: Rect) {
         .take(visible)
         .map(|(i, e)| {
             let is_sel = i == app.hist_sel;
-            let pct = e.retained_size as f64 / total as f64 * 100.0;
+            let (pct_str, abnormal) = retained_pct(e.retained_size, total);
             let rs = if is_sel { sel() } else { sty() };
-            let ps = if is_sel { sel() } else { pct_style(pct) };
+            let ps = pct_display_style(&pct_str, abnormal, is_sel);
+            let ret_s = if abnormal && !is_sel {
+                Style::default().fg(DANGER)
+            } else {
+                ps
+            };
             Row::new(vec![
                 Cell::from(format!("{}", i + 1)).style(dim()),
                 Cell::from(shorten(&e.class_name, 46)).style(rs),
                 Cell::from(fmt_n(e.instance_count)).style(rs),
                 Cell::from(fmt_bytes(e.shallow_size)).style(rs),
-                Cell::from(fmt_bytes(e.retained_size)).style(ps),
-                Cell::from(format!("{:.2}%", pct)).style(ps),
+                Cell::from(fmt_bytes(e.retained_size)).style(ret_s),
+                Cell::from(pct_str).style(ps),
             ])
             .height(1)
             .style(rs)
@@ -356,11 +419,11 @@ fn tab_histogram(f: &mut Frame, app: &App, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(6),
+            Constraint::Length(5),
             Constraint::Min(30),
             Constraint::Length(11),
             Constraint::Length(11),
-            Constraint::Length(11),
+            Constraint::Length(12),
             Constraint::Length(8),
         ],
     )
@@ -402,7 +465,7 @@ fn tab_retained(f: &mut Frame, app: &App, area: Rect) {
         .take(vis)
         .map(|(i, e)| {
             let is_sel = i == app.ret_sel;
-            let pct = e.retained_size as f64 / total as f64 * 100.0;
+            let (pct_str, abnormal) = retained_pct(e.retained_size, total);
             let ovh = if e.shallow_size > 0 {
                 e.retained_size as f64 / e.shallow_size as f64
             } else {
@@ -411,12 +474,10 @@ fn tab_retained(f: &mut Frame, app: &App, area: Rect) {
             let rs = if is_sel { sel() } else { sty() };
             let ret_s = if is_sel {
                 sel()
-            } else if pct > 10.0 {
+            } else if abnormal {
                 Style::default().fg(DANGER)
-            } else if pct > 3.0 {
-                Style::default().fg(WARN)
             } else {
-                acc()
+                pct_display_style(&pct_str, false, false)
             };
             let ovh_s = if is_sel {
                 sel()
@@ -431,38 +492,33 @@ fn tab_retained(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(fmt_n(e.instance_count)).style(rs),
                 Cell::from(fmt_bytes(e.shallow_size)).style(rs),
                 Cell::from(fmt_bytes(e.retained_size)).style(ret_s),
-                Cell::from(format!("{:.1}×", ovh)).style(ovh_s),
-                Cell::from(format!("{:.2}%", pct)).style(ret_s),
+                Cell::from(if ovh > 9999.0 {
+                    "⚠huge".to_string()
+                } else {
+                    format!("{:.1}×", ovh)
+                })
+                .style(ovh_s),
+                Cell::from(pct_str).style(ret_s),
             ])
             .height(1)
             .style(rs)
         })
         .collect();
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(5),
-            Constraint::Min(28),
-            Constraint::Length(11),
-            Constraint::Length(11),
-            Constraint::Length(11),
-            Constraint::Length(8),
-            Constraint::Length(8),
-        ],
-    )
-    .header(header_row([
-        "#",
-        "Class",
-        "Instances",
-        "Shallow",
-        "Retained",
-        "×Overhead",
-        "% Heap",
-    ]))
-    .block(panel(
-        "Retained Sizes — sorted by retained size (Lengauer-Tarjan dominator tree)",
-    ))
+    let table = Table::new(rows, [
+        Constraint::Length(5), Constraint::Min(28), Constraint::Length(10),
+        Constraint::Length(11), Constraint::Length(12), Constraint::Length(8), Constraint::Length(8),
+    ])
+    .header(header_row(["#","Class","Instances","Shallow","Retained","×Over","% Heap"]))
+    .block({
+        let has_overflow = hist.iter().any(|e| e.retained_size > total);
+        let title = if has_overflow {
+            "Retained Sizes  ⚠ some values exceed heap (class-level sum double-counts shared objects)"
+        } else {
+            "Retained Sizes — sorted by retained size (Lengauer-Tarjan dominator tree)"
+        };
+        panel(title)
+    })
     .column_spacing(1);
     f.render_widget(table, chunks[0]);
     scroll_info(f, chunks[0], app.ret_sel + 1, hist.len());
@@ -561,6 +617,18 @@ fn tab_retained(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled("  Tip: ", dim()),
                 Span::styled(retention_tip(&e.class_name), sty()),
             ]),
+            if e.retained_size > total {
+                Line::from(vec![
+                    Span::styled("  ⚠ Note: ", Style::default().fg(DANGER).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("Retained ({}) exceeds heap ({}) — this class's instances collectively dominate                                  overlapping subgraphs. Each instance's retained size includes shared objects,                                  causing double-counting when summed. Use tab [6] to inspect individual objects.",
+                            fmt_bytes(e.retained_size), fmt_bytes(total)),
+                        Style::default().fg(WARN),
+                    ),
+                ])
+            } else {
+                Line::from("")
+            },
         ];
         f.render_widget(
             Paragraph::new(lines)
@@ -611,7 +679,22 @@ fn tab_leaks(f: &mut Frame, app: &App, area: Rect) {
                 })
                 .style(dim()),
                 Cell::from(fmt_bytes(s.retained_size)).style(rs),
-                Cell::from(format!("{:.1}%", s.retained_percentage)).style(rs),
+                Cell::from({
+                    let (p, _) = retained_pct(
+                        s.retained_size,
+                        app.state
+                            .get_summary()
+                            .reachable_heap_size
+                            .max(s.retained_size),
+                    );
+                    // leak suspects use retained_percentage from engine — just cap display
+                    if s.retained_percentage > 100.0 {
+                        "⚠>100%".to_string()
+                    } else {
+                        format!("{:.1}%", s.retained_percentage)
+                    }
+                })
+                .style(rs),
                 Cell::from(shorten(&s.description, 40)).style(dim()),
             ])
             .height(1)
@@ -633,8 +716,8 @@ fn tab_leaks(f: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(5),
             Constraint::Min(26),
             Constraint::Length(14),
-            Constraint::Length(11),
-            Constraint::Length(7),
+            Constraint::Length(12),
+            Constraint::Length(8),
             Constraint::Min(20),
         ],
     )
@@ -890,8 +973,9 @@ fn tab_domtree(f: &mut Frame, app: &App, area: Rect) {
             .take(vis)
             .map(|(i, obj)| {
                 let is_sel = i == app.dom_sel;
-                let pct = obj.retained_size as f64 / total as f64 * 100.0;
+                let (pct_str, abnormal) = retained_pct(obj.retained_size, total);
                 let rs = if is_sel { sel() } else { sty() };
+                let ps = pct_display_style(&pct_str, abnormal, is_sel);
                 let name = if obj.class_name.is_empty() {
                     &obj.node_type
                 } else {
@@ -915,16 +999,8 @@ fn tab_domtree(f: &mut Frame, app: &App, area: Rect) {
                     })
                     .style(dim()),
                     Cell::from(fmt_bytes(obj.shallow_size)).style(rs),
-                    Cell::from(fmt_bytes(obj.retained_size)).style(if is_sel {
-                        sel()
-                    } else {
-                        pct_style(pct)
-                    }),
-                    Cell::from(format!("{:.2}%", pct)).style(if is_sel {
-                        sel()
-                    } else {
-                        pct_style(pct)
-                    }),
+                    Cell::from(fmt_bytes(obj.retained_size)).style(ps),
+                    Cell::from(pct_str).style(ps),
                 ])
                 .height(1)
                 .style(rs)
@@ -1118,6 +1194,40 @@ fn scroll_info(f: &mut Frame, area: Rect, cur: usize, total: usize) {
 
 // ── Format helpers ────────────────────────────────────────────────────────────
 
+/// Compute retained % of heap. Returns (display_string, is_abnormal).
+/// Retained can exceed 100% because summing per-instance retained sizes
+/// double-counts shared subgraphs dominated by different instances of the same class.
+fn retained_pct(retained: u64, heap: u64) -> (String, bool) {
+    if heap == 0 {
+        return ("—".into(), false);
+    }
+    let pct = retained as f64 / heap as f64 * 100.0;
+    if pct > 100.0 {
+        // Compact: "⚠226%" — fits in 8 chars
+        (format!("⚠>100%"), true)
+    } else {
+        (format!("{:.2}%", pct), false)
+    }
+}
+
+/// Style for the % heap cell — red+blink if abnormal (>100%)
+fn pct_display_style(pct_str: &str, is_abnormal: bool, is_sel: bool) -> Style {
+    if is_sel {
+        return sel();
+    }
+    if is_abnormal {
+        return Style::default()
+            .fg(DANGER)
+            .add_modifier(Modifier::RAPID_BLINK);
+    }
+    let pct: f64 = pct_str
+        .trim_start_matches('⚠')
+        .trim_end_matches('%')
+        .parse()
+        .unwrap_or(0.0);
+    pct_style(pct)
+}
+
 pub fn fmt_bytes(b: u64) -> String {
     if b == 0 {
         return "0 B".into();
@@ -1205,7 +1315,9 @@ fn hr(key: &str, desc: &str) -> Line<'static> {
 
 fn retention_tip(class: &str) -> String {
     let c = class.to_lowercase();
-    if c.contains("string") {
+    if c.contains("finalizer") {
+        "Finalizer dominates all finalizable objects in the queue. Close JDBC/IO resources explicitly — never rely on finalize(). This likely indicates unclosed Oracle JDBC statements or streams.".into()
+    } else if c.contains("string") {
         "Use String.intern() or byte[]; audit caches and ThreadLocals.".into()
     } else if c.contains("statement") || c.contains("jdbc") {
         "Close PreparedStatement in try-with-resources; limit statement cache.".into()
