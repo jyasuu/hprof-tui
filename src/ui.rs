@@ -1,3 +1,6 @@
+//! TUI rendering — 7 tabs driven by HeapLens HeapAnalysis trait data.
+
+use crate::app::{shorten, App, Tab};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -8,1293 +11,1220 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, RetainedState, Tab};
-use crate::parser::fmt_bytes;
-use crate::retained::RetainedClassEntry;
+// ── Colour palette ────────────────────────────────────────────────────────────
+const BG: Color = Color::Rgb(13, 16, 23);
+const PANEL: Color = Color::Rgb(20, 24, 35);
+const BORDER: Color = Color::Rgb(48, 58, 90);
+const ACCENT: Color = Color::Rgb(90, 155, 255);
+const TEAL: Color = Color::Rgb(65, 210, 175);
+const WARN: Color = Color::Rgb(255, 195, 70);
+const DANGER: Color = Color::Rgb(255, 80, 80);
+const OK: Color = Color::Rgb(90, 210, 120);
+const DIM: Color = Color::Rgb(85, 95, 125);
+const TEXT: Color = Color::Rgb(205, 212, 232);
+const SEL_BG: Color = Color::Rgb(32, 52, 88);
 
-// ── Colour palette ──────────────────────────────────────────────────────────
-const C_BG: Color = Color::Rgb(15, 17, 26);
-const C_PANEL: Color = Color::Rgb(22, 25, 37);
-const C_BORDER: Color = Color::Rgb(55, 65, 100);
-const C_ACCENT: Color = Color::Rgb(99, 155, 255);
-const C_ACCENT2: Color = Color::Rgb(75, 210, 180);
-const C_WARN: Color = Color::Rgb(255, 195, 80);
-const C_DANGER: Color = Color::Rgb(255, 90, 90);
-const C_LOW: Color = Color::Rgb(100, 220, 130);
-const C_DIM: Color = Color::Rgb(90, 100, 130);
-const C_TEXT: Color = Color::Rgb(210, 215, 235);
-const C_SEL_BG: Color = Color::Rgb(35, 55, 90);
-const C_HEADER: Color = Color::Rgb(140, 155, 200);
-
-fn style() -> Style {
-    Style::default().fg(C_TEXT).bg(C_BG)
+fn sty() -> Style {
+    Style::default().fg(TEXT).bg(BG)
 }
-fn accent() -> Style {
-    Style::default().fg(C_ACCENT)
+fn acc() -> Style {
+    Style::default().fg(ACCENT)
 }
 fn dim() -> Style {
-    Style::default().fg(C_DIM)
+    Style::default().fg(DIM)
 }
-fn header_style() -> Style {
-    Style::default().fg(C_HEADER).add_modifier(Modifier::BOLD)
-}
-fn sel_style() -> Style {
+fn sel() -> Style {
     Style::default()
         .fg(Color::White)
-        .bg(C_SEL_BG)
+        .bg(SEL_BG)
         .add_modifier(Modifier::BOLD)
 }
+fn hdr() -> Style {
+    Style::default()
+        .fg(Color::Rgb(140, 155, 200))
+        .add_modifier(Modifier::BOLD)
+}
+fn warn() -> Style {
+    Style::default().fg(WARN)
+}
 
-// ── Entry point ──────────────────────────────────────────────────────────────
+fn panel(title: &str) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .style(Style::default().bg(PANEL))
+        .title(Span::styled(format!(" {} ", title), acc()))
+        .title_alignment(Alignment::Left)
+}
+
+fn header_row<const N: usize>(cols: [&str; N]) -> Row<'static> {
+    Row::new(
+        cols.iter()
+            .map(|h| Cell::from(h.to_string()).style(hdr()))
+            .collect::<Vec<_>>(),
+    )
+    .height(1)
+    .style(Style::default().bg(PANEL))
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
 pub fn draw(f: &mut Frame, app: &App) {
-    let area = f.size();
+    let area = f.area();
+    f.render_widget(Block::default().style(sty()), area);
 
-    // Root background
-    f.render_widget(Block::default().style(style()), area);
-
-    // Layout: title bar | tab bar | content | status bar
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // title
-            Constraint::Length(3), // tabs
-            Constraint::Min(0),    // content
-            Constraint::Length(1), // status
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
         ])
         .split(area);
 
-    draw_title(f, app, chunks[0]);
-    draw_tabs(f, app, chunks[1]);
-    draw_content(f, app, chunks[2]);
-    draw_status(f, app, chunks[3]);
+    draw_titlebar(f, app, chunks[0]);
+    draw_tabbar(f, app, chunks[1]);
+    match app.active_tab {
+        Tab::Overview => tab_overview(f, app, chunks[2]),
+        Tab::Histogram => tab_histogram(f, app, chunks[2]),
+        Tab::Retained => tab_retained(f, app, chunks[2]),
+        Tab::LeakSuspects => tab_leaks(f, app, chunks[2]),
+        Tab::Waste => tab_waste(f, app, chunks[2]),
+        Tab::DomTree => tab_domtree(f, app, chunks[2]),
+        Tab::Help => tab_help(f, chunks[2]),
+    }
+    draw_statusbar(f, app, chunks[3]);
 }
 
-// ── Title bar ────────────────────────────────────────────────────────────────
-fn draw_title(f: &mut Frame, app: &App, area: Rect) {
-    use std::path::Path;
-    let filename = Path::new(&app.analysis.summary.file_path)
+// ── Title bar ─────────────────────────────────────────────────────────────────
+fn draw_titlebar(f: &mut Frame, app: &App, area: Rect) {
+    let s = app.state.get_summary();
+    let fname = std::path::Path::new(&app.path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown.hprof");
-
-    let size_str = fmt_bytes(app.analysis.summary.file_size_bytes);
-    let heap_str = fmt_bytes(app.analysis.summary.total_heap_size);
-    let ver = &app.analysis.summary.hprof_version;
-
-    let title_line = Line::from(vec![
+    let dom_badge = if app.has_dominators {
+        Span::styled(" ✓ dominators ", Style::default().fg(OK))
+    } else {
+        Span::styled(" ⚡ phase-1 only ", Style::default().fg(WARN))
+    };
+    let line = Line::from(vec![
         Span::styled(
-            "  ⬡ hprof-tui ",
-            Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
+            "  ⬡ hprof-tui  ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Span::styled("│ ", dim()),
         Span::styled(
-            filename,
-            Style::default().fg(C_ACCENT2).add_modifier(Modifier::BOLD),
+            fname,
+            Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("  {}  on-disk", size_str), dim()),
+        Span::styled(
+            format!(
+                "  {}",
+                std::fs::metadata(&app.path)
+                    .map(|m| fmt_bytes(m.len()))
+                    .unwrap_or_default()
+            ),
+            dim(),
+        ),
+        Span::styled("  │  heap ", dim()),
+        Span::styled(fmt_bytes(s.total_heap_size), acc()),
+        Span::styled("  reachable ", dim()),
+        Span::styled(fmt_bytes(s.reachable_heap_size), acc()),
         Span::styled("  │  ", dim()),
-        Span::styled("heap ", dim()),
-        Span::styled(heap_str, accent()),
+        dom_badge,
         Span::styled("  │  ", dim()),
-        Span::styled(ver, dim()),
+        Span::styled(s.hprof_version.trim_end_matches('\0'), dim()),
     ]);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(C_BORDER))
-        .style(Style::default().bg(C_PANEL));
-
-    let para = Paragraph::new(title_line)
-        .block(block)
-        .alignment(Alignment::Left);
-
-    f.render_widget(para, area);
+    f.render_widget(
+        Paragraph::new(line).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(BORDER))
+                .style(Style::default().bg(PANEL)),
+        ),
+        area,
+    );
 }
 
 // ── Tab bar ───────────────────────────────────────────────────────────────────
-fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
+fn draw_tabbar(f: &mut Frame, app: &App, area: Rect) {
     let titles: Vec<Line> = Tab::ALL
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            if i < 6 {
-                Line::from(vec![
-                    Span::styled(format!("[{}]", i + 1), dim()),
-                    Span::raw(" "),
-                    Span::raw(t.title()),
-                ])
+            let n = if i < 6 {
+                format!("[{}] ", i + 1)
             } else {
-                Line::from(vec![Span::raw(t.title())])
-            }
+                String::new()
+            };
+            Line::from(vec![Span::styled(n, dim()), Span::raw(t.title())])
         })
         .collect();
-
     let tabs = Tabs::new(titles)
         .select(app.active_tab.index())
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(C_BORDER))
-                .style(Style::default().bg(C_PANEL)),
+                .border_style(Style::default().fg(BORDER))
+                .style(Style::default().bg(PANEL)),
         )
-        .highlight_style(Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
         .divider(Span::styled(" │ ", dim()))
         .style(dim());
-
     f.render_widget(tabs, area);
 }
 
-// ── Content dispatcher ───────────────────────────────────────────────────────
-fn draw_content(f: &mut Frame, app: &App, area: Rect) {
-    match app.active_tab {
-        Tab::Overview => draw_overview(f, app, area),
-        Tab::Histogram => draw_histogram(f, app, area),
-        Tab::RetainedGraph => draw_retained(f, app, area),
-        Tab::LeakSuspects => draw_leak_suspects(f, app, area),
-        Tab::GcRoots => draw_gc_roots(f, app, area),
-        Tab::DuplicateStrings => draw_dup_strings(f, app, area),
-        Tab::Help => draw_help(f, area),
-    }
-}
-
-// ── Status bar ───────────────────────────────────────────────────────────────
-fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let msg = if let Some(ref s) = app.status_message {
-        Line::from(vec![Span::styled(
-            format!(" ✦ {}", s),
-            Style::default().fg(C_WARN),
-        )])
+// ── Status bar ────────────────────────────────────────────────────────────────
+fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
+    let line = if let Some(ref msg) = app.status {
+        Line::from(Span::styled(format!(" ✦ {}", msg), warn()))
     } else {
         Line::from(vec![
-            Span::styled(" q", Style::default().fg(C_ACCENT)),
-            Span::styled("/Ctrl-C quit  ", dim()),
-            Span::styled("Tab/←→", Style::default().fg(C_ACCENT)),
-            Span::styled(" switch tab  ", dim()),
-            Span::styled("1-6", Style::default().fg(C_ACCENT)),
-            Span::styled(" jump tab  ", dim()),
-            Span::styled("3", Style::default().fg(C_ACCENT)),
-            Span::styled(" retained sizes  ", dim()),
-            Span::styled("↑↓/jk", Style::default().fg(C_ACCENT)),
+            Span::styled(" q", acc()),
+            Span::styled(" quit  ", dim()),
+            Span::styled("Tab/←→", acc()),
+            Span::styled(" tab  ", dim()),
+            Span::styled("1-6", acc()),
+            Span::styled(" jump  ", dim()),
+            Span::styled("↑↓jk", acc()),
             Span::styled(" scroll  ", dim()),
-            Span::styled("s", Style::default().fg(C_ACCENT)),
+            Span::styled("PgDn/u", acc()),
+            Span::styled(" page  ", dim()),
+            Span::styled("s", acc()),
             Span::styled(" sort  ", dim()),
-            Span::styled("g/G", Style::default().fg(C_ACCENT)),
-            Span::styled(" top/btm  ", dim()),
-            Span::styled("?", Style::default().fg(C_ACCENT)),
+            Span::styled("Enter/i", acc()),
+            Span::styled(" drill-in  ", dim()),
+            Span::styled("Esc/o", acc()),
+            Span::styled(" drill-out  ", dim()),
+            Span::styled("?", acc()),
             Span::styled(" help", dim()),
         ])
     };
-    let para = Paragraph::new(msg).style(Style::default().bg(C_PANEL));
-    f.render_widget(para, area);
+    f.render_widget(Paragraph::new(line).style(Style::default().bg(PANEL)), area);
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// TAB 1: Overview
-// ────────────────────────────────────────────────────────────────────────────
-fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
-    let s = &app.analysis.summary;
+// ── TAB 1: Overview ───────────────────────────────────────────────────────────
+fn tab_overview(f: &mut Frame, app: &App, area: Rect) {
+    let s = app.state.get_summary();
+    let hist = app.state.get_class_histogram();
+    let leaks = app.state.get_leak_suspects();
+    let waste = app.state.get_waste_analysis();
 
-    // Split into left (stats) and right (top classes chart)
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
         .split(area);
-
-    // Left: split into stats + warnings
-    let left_rows = Layout::default()
+    let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(14), Constraint::Min(0)])
+        .constraints([Constraint::Length(13), Constraint::Min(0)])
         .split(cols[0]);
 
-    // ── Stats panel ──
-    let stats_items: Vec<ListItem> = vec![
-        listitem_kv("File", &s.file_path),
-        listitem_kv("Version", &s.hprof_version),
-        listitem_kv("File size", &fmt_bytes(s.file_size_bytes)),
-        listitem_kv("Heap size", &fmt_bytes(s.total_heap_size)),
-        listitem_kv("Instances", &fmt_u64(s.total_instances)),
-        listitem_kv("Classes", &fmt_u64(s.total_classes)),
-        listitem_kv("Arrays", &fmt_u64(s.total_arrays)),
-        listitem_kv("GC roots", &fmt_u64(s.total_gc_roots)),
-        listitem_kv(
-            "Leak suspects",
-            &app.analysis.leak_suspects.len().to_string(),
+    // Stats panel
+    let file_size = std::fs::metadata(&app.path)
+        .map(|m| fmt_bytes(m.len()))
+        .unwrap_or_default();
+    let stats: Vec<ListItem> = vec![
+        lkv("File", shorten(&app.path, 36)),
+        lkv(
+            "Version",
+            s.hprof_version.trim_end_matches('\0').to_string(),
         ),
-        listitem_kv(
-            "Dup strings",
-            &app.analysis.duplicate_strings.len().to_string(),
-        ),
+        lkv("File size", file_size),
+        lkv("Heap (total)", fmt_bytes(s.total_heap_size)),
+        lkv("Reachable", fmt_bytes(s.reachable_heap_size)),
+        lkv("Instances", fmt_n(s.total_instances)),
+        lkv("Classes", fmt_n(s.total_classes)),
+        lkv("Arrays", fmt_n(s.total_arrays)),
+        lkv("GC roots", fmt_n(s.total_gc_roots)),
+        lkv("Leak suspects", leaks.len().to_string()),
+        lkv("Waste", fmt_bytes(waste.total_wasted_bytes)),
     ];
+    f.render_widget(List::new(stats).block(panel("Heap Summary")), left[0]);
 
-    let stats_list = List::new(stats_items).block(panel_block("Heap Summary"));
-    f.render_widget(stats_list, left_rows[0]);
-
-    // ── Leak severity summary ──
-    let high = app
-        .analysis
-        .leak_suspects
+    // Issue badges
+    let high = leaks
         .iter()
-        .filter(|l| l.severity == crate::parser::SuspectSeverity::High)
+        .filter(|l| l.retained_percentage >= 30.0)
         .count();
-    let med = app
-        .analysis
-        .leak_suspects
+    let med = leaks
         .iter()
-        .filter(|l| l.severity == crate::parser::SuspectSeverity::Medium)
+        .filter(|l| l.retained_percentage >= 15.0 && l.retained_percentage < 30.0)
         .count();
-    let low = app
-        .analysis
-        .leak_suspects
+    let low = leaks
         .iter()
-        .filter(|l| l.severity == crate::parser::SuspectSeverity::Low)
+        .filter(|l| l.retained_percentage < 15.0)
         .count();
-
-    let sev_items: Vec<ListItem> = vec![
+    let badges: Vec<ListItem> = vec![
+        badge("● HIGH", DANGER, high, ">30% heap"),
+        badge("● MED ", WARN, med, "15–30% heap"),
+        badge("● LOW ", OK, low, "5–15% heap"),
         ListItem::new(Line::from(vec![
+            Span::styled("  Waste total  ", dim()),
             Span::styled(
-                "  ● HIGH  ",
-                Style::default().fg(C_DANGER).add_modifier(Modifier::BOLD),
+                format!(
+                    "{:.1}%  ({})",
+                    waste.waste_percentage,
+                    fmt_bytes(waste.total_wasted_bytes)
+                ),
+                warn(),
             ),
-            Span::styled(high.to_string(), Style::default().fg(C_TEXT)),
-            Span::styled(" class(es) retaining >30% of heap", dim()),
-        ])),
-        ListItem::new(Line::from(vec![
-            Span::styled(
-                "  ● MED   ",
-                Style::default().fg(C_WARN).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(med.to_string(), Style::default().fg(C_TEXT)),
-            Span::styled(" class(es) retaining 15-30% of heap", dim()),
-        ])),
-        ListItem::new(Line::from(vec![
-            Span::styled(
-                "  ● LOW   ",
-                Style::default().fg(C_LOW).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(low.to_string(), Style::default().fg(C_TEXT)),
-            Span::styled(" class(es) retaining 5-15% of heap", dim()),
         ])),
     ];
+    f.render_widget(List::new(badges).block(panel("Issues")), left[1]);
 
-    let sev_list = List::new(sev_items).block(panel_block("Leak Suspects at a Glance"));
-    f.render_widget(sev_list, left_rows[1]);
-
-    // ── Right: Top 15 classes bar chart ──
-    let right_rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0)])
-        .split(cols[1]);
-
-    let hist = &app.analysis.class_histogram;
-    let max_size = hist.first().map(|e| e.shallow_size).unwrap_or(1).max(1);
-
-    // Each bar occupies 2 lines: label row + gauge row
-    let bar_area = right_rows[0];
-    let inner_h = bar_area.height.saturating_sub(2) as usize; // subtract block border
-    let max_entries = (inner_h / 2).min(15).min(hist.len());
-
-    // Build rows as text lines
+    // Right: bar chart by retained size
+    let max_ret = hist.first().map(|e| e.retained_size).unwrap_or(1).max(1);
+    let inner_h = cols[1].height.saturating_sub(2) as usize;
+    let max_bars = (inner_h / 2).min(15).min(hist.len());
+    let bar_w = (cols[1].width.saturating_sub(14) as usize).min(50);
     let mut lines: Vec<Line> = Vec::new();
-    for (i, entry) in hist.iter().take(max_entries).enumerate() {
-        let pct = (entry.shallow_size as f64 / max_size as f64 * 100.0) as u16;
-        let short_name = shorten_class(&entry.class_name, 36);
-        let rank_color = if i == 0 {
-            C_DANGER
+    for (i, e) in hist.iter().take(max_bars).enumerate() {
+        let pct = (e.retained_size as f64 / max_ret as f64 * 100.0) as u16;
+        let col = if i == 0 {
+            DANGER
         } else if i < 3 {
-            C_WARN
+            WARN
         } else {
-            C_ACCENT
+            ACCENT
         };
-
-        // Label line
+        let filled = (pct as usize * bar_w / 100).min(bar_w);
         lines.push(Line::from(vec![
-            Span::styled(format!(" {:>3}. ", i + 1), Style::default().fg(rank_color)),
-            Span::styled(format!("{:<36}", short_name), Style::default().fg(C_TEXT)),
-            Span::styled(format!(" {:>8}", fmt_bytes(entry.shallow_size)), accent()),
-            Span::styled(format!("  ×{}", fmt_u64(entry.instance_count)), dim()),
+            Span::styled(format!(" {:>2}. ", i + 1), Style::default().fg(col)),
+            Span::styled(format!("{:<38}", shorten(&e.class_name, 38)), sty()),
+            Span::styled(format!(" {:>10}", fmt_bytes(e.retained_size)), acc()),
         ]));
-
-        // Gauge line — draw a Unicode block bar
-        let bar_width = (bar_area.width.saturating_sub(6) as usize).min(60);
-        let filled = (pct as usize * bar_width / 100).min(bar_width);
-        let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
         lines.push(Line::from(vec![
             Span::raw("      "),
-            Span::styled(bar, Style::default().fg(rank_color)),
+            Span::styled(
+                "█".repeat(filled) + &"░".repeat(bar_w - filled),
+                Style::default().fg(col),
+            ),
             Span::styled(format!(" {:>3}%", pct), dim()),
         ]));
     }
-
-    let para = Paragraph::new(lines)
-        .block(panel_block("Top Classes by Shallow Size"))
-        .wrap(Wrap { trim: false });
-    f.render_widget(para, bar_area);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(panel("Top Classes by Retained Size"))
+            .wrap(Wrap { trim: false }),
+        cols[1],
+    );
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// TAB 2: Class Histogram
-// ────────────────────────────────────────────────────────────────────────────
-fn draw_histogram(f: &mut Frame, app: &App, area: Rect) {
-    let hist = &app.analysis.class_histogram;
-    let total_heap = app.analysis.summary.total_heap_size.max(1);
-
-    let header_cells = ["#", "Class Name", "Instances", "Shallow Size", "% Heap"]
-        .iter()
-        .map(|h| Cell::from(*h).style(header_style()));
-    let header = Row::new(header_cells)
-        .height(1)
-        .bottom_margin(0)
-        .style(Style::default().bg(C_PANEL));
-
+// ── TAB 2: Histogram ─────────────────────────────────────────────────────────
+fn tab_histogram(f: &mut Frame, app: &App, area: Rect) {
+    let entries = app.sorted_histogram();
+    let total = app.state.get_summary().total_heap_size.max(1);
     let visible = area.height.saturating_sub(5) as usize;
-    let scroll = app.histogram_scroll;
-
-    let rows: Vec<Row> = hist
-        .iter()
-        .enumerate()
-        .skip(scroll)
-        .take(visible)
-        .map(|(i, entry)| {
-            let pct = entry.shallow_size as f64 / total_heap as f64 * 100.0;
-            let pct_str = format!("{:.2}%", pct);
-            let is_sel = i == app.histogram_selected;
-
-            let row_style = if is_sel { sel_style() } else { style() };
-
-            let rank_str = format!("{}", i + 1);
-            let name_style = if pct > 15.0 {
-                Style::default().fg(C_DANGER)
-            } else if pct > 5.0 {
-                Style::default().fg(C_WARN)
-            } else {
-                Style::default().fg(C_TEXT)
-            };
-
-            Row::new(vec![
-                Cell::from(rank_str).style(dim()),
-                Cell::from(entry.class_name.clone()).style(if is_sel {
-                    sel_style()
-                } else {
-                    name_style
-                }),
-                Cell::from(fmt_u64(entry.instance_count)).style(row_style),
-                Cell::from(fmt_bytes(entry.shallow_size)).style(row_style),
-                Cell::from(pct_str).style(if is_sel {
-                    sel_style()
-                } else {
-                    pct_color_style(pct)
-                }),
-            ])
-            .height(1)
-            .style(row_style)
-        })
-        .collect();
-
-    let sort_label = if app.sort_by_count { "count" } else { "size" };
+    let sort_lbl = if app.hist_sort_retained {
+        "retained"
+    } else {
+        "shallow"
+    };
     let title = format!(
-        "Class Histogram  ({} classes)  sorted by {}  [s] toggle",
-        hist.len(),
-        sort_label
+        "Class Histogram — {} classes — sorted by {}  [s] toggle",
+        entries.len(),
+        sort_lbl
     );
 
-    let scroll_info = format!(" {}/{} ", app.histogram_selected + 1, hist.len());
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(5),
-            Constraint::Min(35),
-            Constraint::Length(12),
-            Constraint::Length(13),
-            Constraint::Length(8),
-        ],
-    )
-    .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(C_BORDER))
-            .style(Style::default().bg(C_PANEL))
-            .title(Span::styled(format!(" {} ", title), accent()))
-            .title_alignment(Alignment::Left)
-            .title_bottom(Span::styled(scroll_info, dim())),
-    )
-    .column_spacing(1);
-
-    f.render_widget(table, area);
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// TAB 3: Leak Suspects
-// ────────────────────────────────────────────────────────────────────────────
-fn draw_leak_suspects(f: &mut Frame, app: &App, area: Rect) {
-    let suspects = &app.analysis.leak_suspects;
-
-    // Split: list on top, detail pane on bottom
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(7)])
-        .split(area);
-
-    let header_cells = [
-        "Sev",
-        "Class Name",
-        "Instances",
-        "Shallow Size",
-        "% of Heap",
-    ]
-    .iter()
-    .map(|h| Cell::from(*h).style(header_style()));
-    let header = Row::new(header_cells)
-        .height(1)
-        .style(Style::default().bg(C_PANEL));
-
-    let visible = chunks[0].height.saturating_sub(5) as usize;
-    let scroll = app.leak_scroll;
-
-    let rows: Vec<Row> = suspects
+    let rows: Vec<Row> = entries
         .iter()
         .enumerate()
-        .skip(scroll)
+        .skip(app.hist_scroll)
         .take(visible)
-        .map(|(i, s)| {
-            let is_sel = i == app.leak_selected;
-            let sev_color = severity_color(&s.severity);
-            let row_style = if is_sel { sel_style() } else { style() };
-
-            Row::new(vec![
-                Cell::from(s.severity.label())
-                    .style(Style::default().fg(sev_color).add_modifier(Modifier::BOLD)),
-                Cell::from(s.class_name.clone()).style(if is_sel {
-                    sel_style()
-                } else {
-                    Style::default().fg(sev_color)
-                }),
-                Cell::from(fmt_u64(s.instance_count)).style(row_style),
-                Cell::from(fmt_bytes(s.total_shallow_size)).style(row_style),
-                Cell::from(format!("{:.1}%", s.heap_percentage)).style(row_style),
-            ])
-            .height(1)
-            .style(row_style)
-        })
-        .collect();
-
-    let no_suspects = suspects.is_empty();
-    let table_title = if no_suspects {
-        " ✔ No Leak Suspects Detected ".to_string()
-    } else {
-        format!(
-            " ⚠ {} Leak Suspect(s) — classes retaining >5% of heap ",
-            suspects.len()
-        )
-    };
-
-    let scroll_info = if !suspects.is_empty() {
-        format!(" {}/{} ", app.leak_selected + 1, suspects.len())
-    } else {
-        String::new()
-    };
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(5),
-            Constraint::Min(35),
-            Constraint::Length(12),
-            Constraint::Length(13),
-            Constraint::Length(10),
-        ],
-    )
-    .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(C_BORDER))
-            .style(Style::default().bg(C_PANEL))
-            .title(Span::styled(
-                table_title,
-                Style::default().fg(C_WARN).add_modifier(Modifier::BOLD),
-            ))
-            .title_alignment(Alignment::Left)
-            .title_bottom(Span::styled(scroll_info, dim())),
-    )
-    .column_spacing(1);
-
-    f.render_widget(table, chunks[0]);
-
-    // ── Detail pane for selected suspect ──
-    let detail_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(C_BORDER))
-        .style(Style::default().bg(C_PANEL))
-        .title(Span::styled(" Details ", accent()));
-
-    if let Some(s) = suspects.get(app.leak_selected) {
-        let sev_color = severity_color(&s.severity);
-        let lines = vec![
-            Line::from(vec![
-                Span::styled("  Class:    ", dim()),
-                Span::styled(
-                    &s.class_name,
-                    Style::default().fg(sev_color).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("  Severity: ", dim()),
-                Span::styled(
-                    s.severity.label(),
-                    Style::default().fg(sev_color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("  ({:.1}% of heap)", s.heap_percentage), dim()),
-            ]),
-            Line::from(vec![
-                Span::styled("  Retained: ", dim()),
-                Span::styled(fmt_bytes(s.total_shallow_size), accent()),
-                Span::styled(
-                    format!("  across {} instance(s)", fmt_u64(s.instance_count)),
-                    dim(),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("  Tip: ", dim()),
-                Span::styled(leak_tip(&s.class_name), Style::default().fg(C_TEXT)),
-            ]),
-        ];
-        let para = Paragraph::new(lines)
-            .block(detail_block)
-            .wrap(Wrap { trim: false });
-        f.render_widget(para, chunks[1]);
-    } else {
-        let para = Paragraph::new("  No suspect selected.")
-            .style(dim())
-            .block(detail_block);
-        f.render_widget(para, chunks[1]);
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// TAB 4: GC Roots
-// ────────────────────────────────────────────────────────────────────────────
-fn draw_gc_roots(f: &mut Frame, app: &App, area: Rect) {
-    // Count by root type
-    let roots = &app.analysis.gc_roots;
-    let total = roots.len();
-
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-        .split(area);
-
-    // ── Left: summary by type ──
-    let mut type_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for r in roots {
-        *type_counts.entry(r.root_type.as_str()).or_insert(0) += 1;
-    }
-    let mut type_vec: Vec<_> = type_counts.iter().collect();
-    type_vec.sort_by(|a, b| b.1.cmp(a.1));
-
-    let summary_items: Vec<ListItem> = type_vec
-        .iter()
-        .map(|(name, count)| {
-            let pct = **count as f64 / total.max(1) as f64 * 100.0;
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("  {:<18}", name), Style::default().fg(C_TEXT)),
-                Span::styled(format!("{:>6}", count), accent()),
-                Span::styled(format!("  ({:.1}%)", pct), dim()),
-            ]))
-        })
-        .collect();
-
-    let summary_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(C_BORDER))
-        .style(Style::default().bg(C_PANEL))
-        .title(Span::styled(
-            format!(" GC Root Types ({} total) ", total),
-            accent(),
-        ));
-
-    f.render_widget(List::new(summary_items).block(summary_block), cols[0]);
-
-    // ── Right: scrollable list of roots ──
-    let header_cells = ["#", "Object ID (hex)", "Root Type"]
-        .iter()
-        .map(|h| Cell::from(*h).style(header_style()));
-    let header = Row::new(header_cells)
-        .height(1)
-        .style(Style::default().bg(C_PANEL));
-
-    let visible = area.height.saturating_sub(5) as usize;
-    let scroll = app.gc_scroll;
-
-    let rows: Vec<Row> = roots
-        .iter()
-        .enumerate()
-        .skip(scroll)
-        .take(visible)
-        .map(|(i, r)| {
-            let is_sel = i == app.gc_selected;
-            let row_style = if is_sel { sel_style() } else { style() };
+        .map(|(i, e)| {
+            let is_sel = i == app.hist_sel;
+            let pct = e.retained_size as f64 / total as f64 * 100.0;
+            let rs = if is_sel { sel() } else { sty() };
+            let ps = if is_sel { sel() } else { pct_style(pct) };
             Row::new(vec![
                 Cell::from(format!("{}", i + 1)).style(dim()),
-                Cell::from(format!("0x{:016x}", r.object_id)).style(row_style),
-                Cell::from(r.root_type.clone()).style(if is_sel {
-                    sel_style()
-                } else {
-                    Style::default().fg(C_ACCENT2)
-                }),
+                Cell::from(shorten(&e.class_name, 46)).style(rs),
+                Cell::from(fmt_n(e.instance_count)).style(rs),
+                Cell::from(fmt_bytes(e.shallow_size)).style(rs),
+                Cell::from(fmt_bytes(e.retained_size)).style(ps),
+                Cell::from(format!("{:.2}%", pct)).style(ps),
             ])
             .height(1)
-            .style(row_style)
+            .style(rs)
         })
         .collect();
-
-    let scroll_info = if total > 0 {
-        format!(" {}/{} ", app.gc_selected + 1, total)
-    } else {
-        String::new()
-    };
 
     let table = Table::new(
         rows,
         [
             Constraint::Length(6),
-            Constraint::Length(20),
-            Constraint::Min(20),
+            Constraint::Min(30),
+            Constraint::Length(11),
+            Constraint::Length(11),
+            Constraint::Length(11),
+            Constraint::Length(8),
         ],
     )
-    .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(C_BORDER))
-            .style(Style::default().bg(C_PANEL))
-            .title(Span::styled(" GC Root Objects ", accent()))
-            .title_bottom(Span::styled(scroll_info, dim())),
-    )
-    .column_spacing(2);
+    .header(header_row([
+        "#",
+        "Class",
+        "Instances",
+        "Shallow",
+        "Retained",
+        "% Heap",
+    ]))
+    .block(panel(&title))
+    .column_spacing(1);
 
-    f.render_widget(table, cols[1]);
+    f.render_widget(table, area);
+    scroll_info(f, area, app.hist_sel + 1, entries.len());
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// TAB 5: Duplicate Strings
-// ────────────────────────────────────────────────────────────────────────────
-fn draw_dup_strings(f: &mut Frame, app: &App, area: Rect) {
-    let dups = &app.analysis.duplicate_strings;
+// ── TAB 3: Retained ──────────────────────────────────────────────────────────
+fn tab_retained(f: &mut Frame, app: &App, area: Rect) {
+    if !app.has_dominators {
+        f.render_widget(no_dom_msg("Retained Sizes"), area);
+        return;
+    }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(0)])
+        .constraints([Constraint::Min(0), Constraint::Length(11)])
         .split(area);
 
-    // ── Summary gauge ──
-    let total_wasted: u64 = dups.iter().map(|d| d.wasted_bytes).sum();
-    let heap_size = app.analysis.summary.total_heap_size.max(1);
-    let waste_pct = (total_wasted as f64 / heap_size as f64 * 100.0).min(100.0) as u16;
+    let hist = app.state.get_class_histogram(); // retained-sorted by engine
+    let total = app.state.get_summary().total_heap_size.max(1);
+    let vis = chunks[0].height.saturating_sub(5) as usize;
 
-    let gauge_label = format!(
-        " Total wasted by duplicate strings: {}  ({:.1}% of heap) ",
-        fmt_bytes(total_wasted),
-        waste_pct
-    );
-
-    let gauge = Gauge::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(C_BORDER))
-                .style(Style::default().bg(C_PANEL))
-                .title(Span::styled(" Waste Summary ", accent())),
-        )
-        .gauge_style(Style::default().fg(C_ACCENT).bg(C_PANEL))
-        .percent(waste_pct)
-        .label(gauge_label);
-
-    f.render_widget(gauge, chunks[0]);
-
-    // ── Table of duplicate strings ──
-    let header_cells = ["#", "Value Preview", "Count", "Wasted"]
-        .iter()
-        .map(|h| Cell::from(*h).style(header_style()));
-    let header = Row::new(header_cells)
-        .height(1)
-        .style(Style::default().bg(C_PANEL));
-
-    let visible = chunks[1].height.saturating_sub(5) as usize;
-    let scroll = app.dup_scroll;
-
-    let rows: Vec<Row> = dups
+    let rows: Vec<Row> = hist
         .iter()
         .enumerate()
-        .skip(scroll)
-        .take(visible)
-        .map(|(i, d)| {
-            let is_sel = i == app.dup_selected;
-            let row_style = if is_sel { sel_style() } else { style() };
+        .skip(app.ret_scroll)
+        .take(vis)
+        .map(|(i, e)| {
+            let is_sel = i == app.ret_sel;
+            let pct = e.retained_size as f64 / total as f64 * 100.0;
+            let ovh = if e.shallow_size > 0 {
+                e.retained_size as f64 / e.shallow_size as f64
+            } else {
+                1.0
+            };
+            let rs = if is_sel { sel() } else { sty() };
+            let ret_s = if is_sel {
+                sel()
+            } else if pct > 10.0 {
+                Style::default().fg(DANGER)
+            } else if pct > 3.0 {
+                Style::default().fg(WARN)
+            } else {
+                acc()
+            };
+            let ovh_s = if is_sel {
+                sel()
+            } else if ovh > 5.0 {
+                Style::default().fg(WARN)
+            } else {
+                dim()
+            };
             Row::new(vec![
                 Cell::from(format!("{}", i + 1)).style(dim()),
-                Cell::from(d.value_preview.clone()).style(row_style),
-                Cell::from(fmt_u64(d.count)).style(row_style),
-                Cell::from(fmt_bytes(d.wasted_bytes)).style(if is_sel {
-                    sel_style()
-                } else {
-                    Style::default().fg(C_WARN)
-                }),
+                Cell::from(shorten(&e.class_name, 42)).style(rs),
+                Cell::from(fmt_n(e.instance_count)).style(rs),
+                Cell::from(fmt_bytes(e.shallow_size)).style(rs),
+                Cell::from(fmt_bytes(e.retained_size)).style(ret_s),
+                Cell::from(format!("{:.1}×", ovh)).style(ovh_s),
+                Cell::from(format!("{:.2}%", pct)).style(ret_s),
             ])
             .height(1)
-            .style(row_style)
+            .style(rs)
         })
         .collect();
-
-    let scroll_info = if !dups.is_empty() {
-        format!(" {}/{} ", app.dup_selected + 1, dups.len())
-    } else {
-        String::new()
-    };
-
-    let empty_msg = "  No duplicate string groups detected.";
-    let content_note = if dups.is_empty() { empty_msg } else { "" };
 
     let table = Table::new(
         rows,
         [
             Constraint::Length(5),
-            Constraint::Min(40),
-            Constraint::Length(10),
-            Constraint::Length(12),
+            Constraint::Min(28),
+            Constraint::Length(11),
+            Constraint::Length(11),
+            Constraint::Length(11),
+            Constraint::Length(8),
+            Constraint::Length(8),
         ],
     )
-    .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(C_BORDER))
-            .style(Style::default().bg(C_PANEL))
-            .title(Span::styled(
-                format!(" Duplicate Strings ({} groups) ", dups.len()),
-                accent(),
-            ))
-            .title_bottom(Span::styled(scroll_info, dim())),
-    )
-    .column_spacing(1);
-
-    if dups.is_empty() {
-        let para = Paragraph::new(content_note).style(dim()).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(C_BORDER))
-                .style(Style::default().bg(C_PANEL))
-                .title(Span::styled(" Duplicate Strings ", accent())),
-        );
-        f.render_widget(para, chunks[1]);
-    } else {
-        f.render_widget(table, chunks[1]);
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// TAB 6: Help
-// ────────────────────────────────────────────────────────────────────────────
-fn draw_help(f: &mut Frame, area: Rect) {
-    let text = vec![
-        Line::from(vec![Span::styled(
-            "  hprof-tui — Terminal HPROF Heap Dump Analyzer",
-            Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  Navigation",
-            Style::default().fg(C_ACCENT2).add_modifier(Modifier::BOLD),
-        )]),
-        help_row("Tab / →", "Next tab"),
-        help_row("Shift+Tab / ←", "Previous tab"),
-        help_row("1-5", "Jump to tab directly"),
-        help_row("↑ / k", "Scroll up one row"),
-        help_row("↓ / j", "Scroll down one row"),
-        help_row("Page Up / u", "Scroll up 10 rows"),
-        help_row("Page Down / d", "Scroll down 10 rows"),
-        help_row("g / Home", "Jump to top"),
-        help_row("G / End", "Jump to bottom"),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  Actions",
-            Style::default().fg(C_ACCENT2).add_modifier(Modifier::BOLD),
-        )]),
-        help_row("s", "Toggle histogram sort: size ↔ count"),
-        help_row("q / Ctrl-C", "Quit"),
-        help_row("?", "Show this help screen"),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  Tabs",
-            Style::default().fg(C_ACCENT2).add_modifier(Modifier::BOLD),
-        )]),
-        help_row("1 Overview", "Heap summary stats + top classes bar chart"),
-        help_row("2 Histogram", "All classes sorted by shallow size or count"),
-        help_row(
-            "3 Retained/Graph",
-            "Retained sizes + heap ingredient breakdown per class",
-        ),
-        help_row(
-            "4 Leak Suspects",
-            "Classes retaining >5% of heap, with severity",
-        ),
-        help_row("5 GC Roots", "GC root object summary by type"),
-        help_row(
-            "6 Dup Strings",
-            "Duplicate java.lang.String instances wasting heap",
-        ),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  Colour Key",
-            Style::default().fg(C_ACCENT2).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(vec![
-            Span::raw("    "),
-            Span::styled("■ RED", Style::default().fg(C_DANGER)),
-            Span::styled(" = HIGH severity / >30% heap    ", dim()),
-            Span::styled("■ YELLOW", Style::default().fg(C_WARN)),
-            Span::styled(" = MED / 15-30%    ", dim()),
-            Span::styled("■ GREEN", Style::default().fg(C_LOW)),
-            Span::styled(" = LOW / 5-15%", dim()),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  Tip: ", dim()),
-            Span::styled("Open a heap dump with: ", dim()),
-            Span::styled(
-                "hprof-tui <path/to/heap.hprof>",
-                Style::default().fg(C_ACCENT2),
-            ),
-        ]),
-    ];
-
-    let para = Paragraph::new(text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(C_BORDER))
-                .style(Style::default().bg(C_PANEL))
-                .title(Span::styled(" Help ", accent())),
-        )
-        .wrap(Wrap { trim: false });
-
-    f.render_widget(para, area);
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ────────────────────────────────────────────────────────────────────────────
-
-fn panel_block(title: &str) -> Block<'_> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(C_BORDER))
-        .style(Style::default().bg(C_PANEL))
-        .title(Span::styled(format!(" {} ", title), accent()))
-        .title_alignment(Alignment::Left)
-}
-
-fn listitem_kv(key: &str, val: &str) -> ListItem<'static> {
-    ListItem::new(Line::from(vec![
-        Span::styled(format!("  {:<16}", key), dim()),
-        Span::styled(val.to_string(), Style::default().fg(C_TEXT)),
-    ]))
-}
-
-fn fmt_u64(n: u64) -> String {
-    // Add thousands separators
-    let s = n.to_string();
-    let mut result = String::new();
-    for (i, ch) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(ch);
-    }
-    result.chars().rev().collect()
-}
-
-fn shorten_class(name: &str, max_len: usize) -> String {
-    if name.len() <= max_len {
-        return name.to_string();
-    }
-    // Try to keep the simple class name at the end
-    if let Some(dot_pos) = name.rfind('.') {
-        let simple = &name[dot_pos + 1..];
-        if simple.len() + 3 <= max_len {
-            let prefix_len = max_len - simple.len() - 3;
-            let prefix = &name[..prefix_len];
-            return format!("{}…{}", prefix, simple);
-        }
-        return format!("…{}", &simple[..simple.len().min(max_len - 1)]);
-    }
-    format!("{}…", &name[..max_len - 1])
-}
-
-fn severity_color(sev: &crate::parser::SuspectSeverity) -> Color {
-    match sev {
-        crate::parser::SuspectSeverity::High => C_DANGER,
-        crate::parser::SuspectSeverity::Medium => C_WARN,
-        crate::parser::SuspectSeverity::Low => C_LOW,
-    }
-}
-
-fn pct_color_style(pct: f64) -> Style {
-    if pct > 30.0 {
-        Style::default().fg(C_DANGER)
-    } else if pct > 15.0 {
-        Style::default().fg(C_WARN)
-    } else if pct > 5.0 {
-        Style::default().fg(C_ACCENT)
-    } else {
-        dim()
-    }
-}
-
-fn help_row(key: &str, desc: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("  {:<22}", key), Style::default().fg(C_ACCENT)),
-        Span::styled(desc.to_string(), Style::default().fg(C_TEXT)),
-    ])
-}
-
-fn leak_tip(class_name: &str) -> String {
-    let cn = class_name.to_lowercase();
-    if cn.contains("string") {
-        "Consider string interning or using byte arrays instead.".to_string()
-    } else if cn.contains("hashmap") || cn.contains("map") {
-        "Review map lifecycle; consider weak references or explicit eviction.".to_string()
-    } else if cn.contains("list") || cn.contains("array") {
-        "Check for unbounded list growth; add capacity limits or LRU eviction.".to_string()
-    } else if cn.contains("thread") {
-        "Thread objects alive may indicate thread-local leaks or pool misconfiguration.".to_string()
-    } else if cn.contains("byte[]") || cn.contains("[b") {
-        "Large byte arrays may be undrained I/O buffers or cached blobs.".to_string()
-    } else if cn.contains("cache") {
-        "Cache has no eviction policy or is not bounded — set a max size.".to_string()
-    } else {
-        format!(
-            "Review references holding {}; look for static fields or long-lived listeners.",
-            class_name
-        )
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// TAB 3: Retained Size / Object Graph
-// ────────────────────────────────────────────────────────────────────────────
-pub fn draw_retained(f: &mut Frame, app: &App, area: Rect) {
-    match &app.retained_state {
-        RetainedState::NotStarted => {
-            let para = Paragraph::new(vec![
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("  Press ", dim()),
-                    Span::styled("3", Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)),
-                    Span::styled(" or ", dim()),
-                    Span::styled("Enter", Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)),
-                    Span::styled(" to compute retained sizes.", dim()),
-                ]),
-                Line::from(""),
-                Line::from(vec![Span::styled("  This builds the full object reference graph and may take", dim())]),
-                Line::from(vec![Span::styled("  20-120 seconds for large (1+ GB) heap dumps.", dim())]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("  Retained size ", Style::default().fg(C_ACCENT2).add_modifier(Modifier::BOLD)),
-                    Span::styled("= shallow size of an object + everything it exclusively keeps alive.", dim()),
-                ]),
-                Line::from(vec![
-                    Span::styled("  e.g. String shallow=32B but retained=~90B because it owns a char[] backing array.", dim()),
-                ]),
-            ])
-            .block(panel_block("Retained Size & Object Graph  [press 3 or Enter to compute]"))
-            .wrap(Wrap { trim: false });
-            f.render_widget(para, area);
-        }
-
-        RetainedState::Computing => {
-            let para = Paragraph::new(vec![
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    "  ⟳  Computing retained sizes… ",
-                    Style::default().fg(C_WARN).add_modifier(Modifier::BOLD),
-                )]),
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    "  Building object reference graph + BFS retained-size propagation.",
-                    dim(),
-                )]),
-                Line::from(vec![Span::styled("  Please wait — do not quit.", dim())]),
-            ])
-            .block(panel_block("Retained Size & Object Graph"))
-            .wrap(Wrap { trim: false });
-            f.render_widget(para, area);
-        }
-
-        RetainedState::Error(ref msg) => {
-            let para = Paragraph::new(vec![
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    format!("  ✗ Error: {}", msg),
-                    Style::default().fg(C_DANGER),
-                )]),
-                Line::from(""),
-                Line::from(vec![Span::styled("  Press Enter to retry.", dim())]),
-            ])
-            .block(panel_block("Retained Size & Object Graph"))
-            .wrap(Wrap { trim: false });
-            f.render_widget(para, area);
-        }
-
-        RetainedState::Done(ref ra) => {
-            draw_retained_done(f, app, area, ra);
-        }
-    }
-}
-
-fn draw_retained_done(
-    f: &mut Frame,
-    app: &App,
-    area: Rect,
-    ra: &crate::retained::RetainedAnalysis,
-) {
-    // Layout: top table | bottom detail pane
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(12)])
-        .split(area);
-
-    let entries = &ra.entries;
-    let total_heap = app.analysis.summary.total_heap_size.max(1);
-
-    // ── Top: retained class table ────────────────────────────────────────────
-    let header_cells = [
+    .header(header_row([
         "#",
         "Class",
         "Instances",
         "Shallow",
         "Retained",
         "×Overhead",
-        "% Heap (ret)",
-    ]
-    .iter()
-    .map(|h| Cell::from(*h).style(header_style()));
-    let header = Row::new(header_cells)
-        .height(1)
-        .style(Style::default().bg(C_PANEL));
-
-    let visible = chunks[0].height.saturating_sub(5) as usize;
-    let scroll = app.retained_scroll;
-
-    let rows: Vec<Row> = entries
-        .iter()
-        .enumerate()
-        .skip(scroll)
-        .take(visible)
-        .map(|(i, e)| {
-            let is_sel = i == app.retained_selected;
-            let pct_ret = e.retained_size as f64 / total_heap as f64 * 100.0;
-            let row_s = if is_sel { sel_style() } else { style() };
-            let ret_s = if is_sel {
-                sel_style()
-            } else if pct_ret > 10.0 {
-                Style::default().fg(C_DANGER)
-            } else if pct_ret > 3.0 {
-                Style::default().fg(C_WARN)
-            } else {
-                Style::default().fg(C_ACCENT)
-            };
-            let oh_s = if is_sel {
-                sel_style()
-            } else if e.overhead_ratio > 5.0 {
-                Style::default().fg(C_WARN)
-            } else {
-                dim()
-            };
-
-            Row::new(vec![
-                Cell::from(format!("{}", i + 1)).style(dim()),
-                Cell::from(shorten_class(&e.class_name, 45)).style(row_s),
-                Cell::from(fmt_u64(e.instance_count)).style(row_s),
-                Cell::from(fmt_bytes(e.shallow_size)).style(row_s),
-                Cell::from(fmt_bytes(e.retained_size)).style(ret_s),
-                Cell::from(format!("{:.1}×", e.overhead_ratio)).style(oh_s),
-                Cell::from(format!("{:.2}%", pct_ret)).style(ret_s),
-            ])
-            .height(1)
-            .style(row_s)
-        })
-        .collect();
-
-    let trunc_note = if ra.truncated {
-        " [capped at 5M objects]"
-    } else {
-        ""
-    };
-    let scroll_info = format!(
-        " {}/{}{} ",
-        app.retained_selected + 1,
-        entries.len(),
-        trunc_note
-    );
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(5),
-            Constraint::Min(30),
-            Constraint::Length(11),
-            Constraint::Length(11),
-            Constraint::Length(11),
-            Constraint::Length(10),
-            Constraint::Length(13),
-        ],
-    )
-    .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(C_BORDER))
-            .style(Style::default().bg(C_PANEL))
-            .title(Span::styled(
-                " Retained Size (sorted by retained) ",
-                accent(),
-            ))
-            .title_alignment(Alignment::Left),
-    )
+        "% Heap",
+    ]))
+    .block(panel(
+        "Retained Sizes — sorted by retained size (Lengauer-Tarjan dominator tree)",
+    ))
     .column_spacing(1);
     f.render_widget(table, chunks[0]);
+    scroll_info(f, chunks[0], app.ret_sel + 1, hist.len());
 
-    // Scroll info as a separate paragraph below the block
-    let si = Paragraph::new(Span::styled(scroll_info, dim()));
-    let si_area = Rect {
-        x: chunks[0].x + 2,
-        y: chunks[0].y + chunks[0].height - 1,
-        width: 40,
-        height: 1,
-    };
-    f.render_widget(si, si_area);
-
-    // ── Bottom: ingredient detail for selected class ──────────────────────────
-    let detail_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(C_BORDER))
-        .style(Style::default().bg(C_PANEL))
-        .title(Span::styled(
-            " Heap Ingredients — what makes up the retained size ",
-            accent(),
-        ));
-
-    if let Some(e) = entries.get(app.retained_selected) {
-        let pct_ret = e.retained_size as f64 / total_heap as f64 * 100.0;
-        let pct_own = if e.retained_size > 0 {
+    // Ingredients detail pane for selected class
+    let detail = panel("Heap Ingredients — overhead breakdown for selected class");
+    if let Some(e) = hist.get(app.ret_sel) {
+        let pct = e.retained_size as f64 / total as f64 * 100.0;
+        let ovh = if e.shallow_size > 0 {
+            e.retained_size as f64 / e.shallow_size as f64
+        } else {
+            1.0
+        };
+        let self_pct = if e.retained_size > 0 {
             e.shallow_size as f64 / e.retained_size as f64 * 100.0
         } else {
             100.0
         };
-
-        let mut lines: Vec<Line> = vec![
-            // Header row
+        let b = |p: u64, tot: u64, w: usize| {
+            let f = if tot > 0 {
+                (p as f64 / tot as f64 * w as f64) as usize
+            } else {
+                0
+            }
+            .min(w);
+            format!("{}{}", "█".repeat(f), "░".repeat(w - f))
+        };
+        let lines = vec![
             Line::from(vec![
                 Span::styled(
-                    format!("  {}", e.class_name),
-                    Style::default().fg(C_ACCENT2).add_modifier(Modifier::BOLD),
+                    format!("  {} ", shorten(&e.class_name, 50)),
+                    Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("  ×{} instances", fmt_u64(e.instance_count)), dim()),
+                Span::styled(format!("  ×{} instances", fmt_n(e.instance_count)), dim()),
             ]),
             Line::from(vec![
-                Span::styled("  Shallow: ", dim()),
-                Span::styled(fmt_bytes(e.shallow_size), accent()),
-                Span::styled("  │  Retained: ", dim()),
+                Span::styled("  Shallow  ", dim()),
+                Span::styled(fmt_bytes(e.shallow_size), acc()),
+                Span::styled("  │  Retained  ", dim()),
                 Span::styled(
                     fmt_bytes(e.retained_size),
-                    Style::default().fg(C_ACCENT2).add_modifier(Modifier::BOLD),
+                    Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("  ({:.2}% of heap)  │  Overhead: ", pct_ret), dim()),
+                Span::styled(format!("  ({:.2}% of heap)", pct), dim()),
+                Span::styled("  │  Overhead  ", dim()),
                 Span::styled(
-                    format!("{:.1}×", e.overhead_ratio),
-                    if e.overhead_ratio > 5.0 {
-                        Style::default().fg(C_WARN)
+                    format!("{:.1}×", ovh),
+                    if ovh > 5.0 {
+                        warn()
                     } else {
-                        Style::default().fg(C_LOW)
+                        Style::default().fg(OK)
                     },
                 ),
-                Span::styled(format!("  │  Avg per instance: ",), dim()),
-                Span::styled(fmt_bytes(e.avg_retained), accent()),
-            ]),
-            Line::from(vec![Span::styled("  ─".repeat(60), dim())]),
-        ];
-
-        // Self contribution bar
-        let self_bar = make_bar(pct_own as u32, 30);
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<42}", "self (own fields)"),
-                Style::default().fg(C_ACCENT),
-            ),
-            Span::styled(format!(" {:>11}", fmt_bytes(e.shallow_size)), accent()),
-            Span::styled(format!("  {}", self_bar), Style::default().fg(C_ACCENT)),
-            Span::styled(format!(" {:.1}%", pct_own), dim()),
-        ]));
-
-        // Contributor bars
-        for c in e.top_contributors.iter().take(5) {
-            let c_pct = if e.retained_size > 0 {
-                c.total_bytes as f64 / e.retained_size as f64 * 100.0
-            } else {
-                0.0
-            };
-            let bar = make_bar(c_pct as u32, 30);
-            let name = shorten_class(&c.class_name, 42);
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {:<42}", name), Style::default().fg(C_TEXT)),
                 Span::styled(
-                    format!(" {:>11}", fmt_bytes(c.total_bytes)),
-                    Style::default().fg(C_ACCENT2),
-                ),
-                Span::styled(format!("  {}", bar), Style::default().fg(C_ACCENT2)),
-                Span::styled(
-                    format!(" {:.1}%  ×{}", c_pct, fmt_u64(c.object_count)),
+                    format!(
+                        "  │  Avg/instance  {}",
+                        fmt_bytes(e.retained_size / e.instance_count.max(1))
+                    ),
                     dim(),
                 ),
-            ]));
-        }
-
-        if e.top_contributors.is_empty() {
-            lines.push(Line::from(vec![Span::styled(
-                "  (no exclusively-owned children — all references are shared)",
-                dim(),
-            )]));
-        }
-
-        let para = Paragraph::new(lines)
-            .block(detail_block)
-            .wrap(Wrap { trim: false });
-        f.render_widget(para, chunks[1]);
+            ]),
+            Line::from(Span::styled("  ─".repeat(55), dim())),
+            Line::from(vec![
+                Span::styled(format!("  {:<40}", "self (own fields)"), acc()),
+                Span::styled(format!(" {:>11}", fmt_bytes(e.shallow_size)), acc()),
+                Span::styled(
+                    format!("  {}", b(e.shallow_size, e.retained_size, 28)),
+                    acc(),
+                ),
+                Span::styled(format!(" {:.1}%", self_pct), dim()),
+            ]),
+            Line::from(vec![
+                Span::styled(format!("  {:<40}", "exclusively-owned children"), dim()),
+                Span::styled(
+                    format!(
+                        " {:>11}",
+                        fmt_bytes(e.retained_size.saturating_sub(e.shallow_size))
+                    ),
+                    Style::default().fg(TEAL),
+                ),
+                Span::styled(
+                    format!(
+                        "  {}",
+                        b(
+                            e.retained_size.saturating_sub(e.shallow_size),
+                            e.retained_size,
+                            28
+                        )
+                    ),
+                    Style::default().fg(TEAL),
+                ),
+                Span::styled(format!(" {:.1}%", 100.0 - self_pct), dim()),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Tip: ", dim()),
+                Span::styled(retention_tip(&e.class_name), sty()),
+            ]),
+        ];
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(detail)
+                .wrap(Wrap { trim: false }),
+            chunks[1],
+        );
     } else {
-        let para = Paragraph::new("  No entry selected.")
-            .style(dim())
-            .block(detail_block);
-        f.render_widget(para, chunks[1]);
+        f.render_widget(
+            Paragraph::new("  No class selected.")
+                .style(dim())
+                .block(detail),
+            chunks[1],
+        );
     }
 }
 
-fn make_bar(pct: u32, width: usize) -> String {
-    let filled = (pct as usize * width / 100).min(width);
-    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+// ── TAB 4: Leak Suspects ─────────────────────────────────────────────────────
+fn tab_leaks(f: &mut Frame, app: &App, area: Rect) {
+    let leaks = app.state.get_leak_suspects();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(7)])
+        .split(area);
+
+    let vis = chunks[0].height.saturating_sub(5) as usize;
+    let rows: Vec<Row> = leaks
+        .iter()
+        .enumerate()
+        .skip(app.leak_scroll)
+        .take(vis)
+        .map(|(i, s)| {
+            let is_sel = i == app.leak_sel;
+            let (sev_lbl, sev_col) = severity_label(s.retained_percentage);
+            let rs = if is_sel { sel() } else { sty() };
+            Row::new(vec![
+                Cell::from(sev_lbl)
+                    .style(Style::default().fg(sev_col).add_modifier(Modifier::BOLD)),
+                Cell::from(shorten(&s.class_name, 40)).style(if is_sel {
+                    sel()
+                } else {
+                    Style::default().fg(sev_col)
+                }),
+                Cell::from(if s.object_id > 0 {
+                    format!("0x{:x}", s.object_id)
+                } else {
+                    "—".into()
+                })
+                .style(dim()),
+                Cell::from(fmt_bytes(s.retained_size)).style(rs),
+                Cell::from(format!("{:.1}%", s.retained_percentage)).style(rs),
+                Cell::from(shorten(&s.description, 40)).style(dim()),
+            ])
+            .height(1)
+            .style(rs)
+        })
+        .collect();
+
+    let title = if leaks.is_empty() {
+        "✔ No Leak Suspects detected".into()
+    } else {
+        format!(
+            "⚠  {} Leak Suspect(s) — objects/classes retaining >10% of heap",
+            leaks.len()
+        )
+    };
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(5),
+            Constraint::Min(26),
+            Constraint::Length(14),
+            Constraint::Length(11),
+            Constraint::Length(7),
+            Constraint::Min(20),
+        ],
+    )
+    .header(header_row([
+        "Sev",
+        "Class",
+        "Object ID",
+        "Retained",
+        "% Heap",
+        "Description",
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default().bg(PANEL))
+            .title(Span::styled(
+                format!(" {} ", title),
+                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            )),
+    )
+    .column_spacing(1);
+    f.render_widget(table, chunks[0]);
+    scroll_info(f, chunks[0], app.leak_sel + 1, leaks.len());
+
+    // Detail pane
+    let det = panel("Suspect Detail");
+    if let Some(s) = leaks.get(app.leak_sel) {
+        let (_, col) = severity_label(s.retained_percentage);
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("  Class:   ", dim()),
+                Span::styled(
+                    &s.class_name,
+                    Style::default().fg(col).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Retained:", dim()),
+                Span::styled(
+                    format!(
+                        " {}  ({:.1}% of heap)",
+                        fmt_bytes(s.retained_size),
+                        s.retained_percentage
+                    ),
+                    acc(),
+                ),
+            ]),
+            if s.object_id > 0 {
+                Line::from(vec![
+                    Span::styled("  Object:  ", dim()),
+                    Span::styled(
+                        format!(
+                            " 0x{:x}  →  press 6, then navigate to this object in Dominator Tree",
+                            s.object_id
+                        ),
+                        acc(),
+                    ),
+                ])
+            } else {
+                Line::from("")
+            },
+            Line::from(vec![
+                Span::styled("  Note:    ", dim()),
+                Span::styled(&s.description, sty()),
+            ]),
+            Line::from(vec![
+                Span::styled("  Fix:     ", dim()),
+                Span::styled(retention_tip(&s.class_name), sty()),
+            ]),
+        ];
+        f.render_widget(
+            Paragraph::new(lines).block(det).wrap(Wrap { trim: false }),
+            chunks[1],
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new("  No suspects — great!")
+                .style(dim())
+                .block(det),
+            chunks[1],
+        );
+    }
+}
+
+// ── TAB 5: Waste ─────────────────────────────────────────────────────────────
+fn tab_waste(f: &mut Frame, app: &App, area: Rect) {
+    let w = app.state.get_waste_analysis();
+    let heap = app.state.get_summary().total_heap_size.max(1);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Length(11),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    // Gauge
+    let pct = (w.total_wasted_bytes as f64 / heap as f64 * 100.0).min(100.0) as u16;
+    f.render_widget(
+        Gauge::default()
+            .block(panel("Waste Overview"))
+            .gauge_style(Style::default().fg(WARN).bg(PANEL))
+            .percent(pct)
+            .label(format!(
+                " Total waste: {}  ({:.1}% of heap) ",
+                fmt_bytes(w.total_wasted_bytes),
+                w.waste_percentage
+            )),
+        chunks[0],
+    );
+
+    // Breakdown list
+    let breakdown: Vec<ListItem> = vec![
+        waste_li(
+            "Duplicate strings",
+            w.duplicate_string_wasted_bytes,
+            w.duplicate_strings.len(),
+        ),
+        waste_li(
+            "Empty collections",
+            w.empty_collection_wasted_bytes,
+            w.empty_collections.len(),
+        ),
+        waste_li(
+            "Over-allocated collections",
+            w.over_allocated_wasted_bytes,
+            w.over_allocated_collections.len(),
+        ),
+        waste_li("Boxed primitives", w.boxed_primitive_wasted_bytes, 0),
+    ];
+    f.render_widget(
+        List::new(breakdown).block(panel("Waste Breakdown")),
+        chunks[1],
+    );
+
+    // Dup strings table
+    if !w.duplicate_strings.is_empty() {
+        let vis = chunks[2].height.saturating_sub(5) as usize;
+        let rows: Vec<Row> = w
+            .duplicate_strings
+            .iter()
+            .enumerate()
+            .skip(app.waste_scroll)
+            .take(vis)
+            .map(|(i, d)| {
+                let is_sel = i == app.waste_sel;
+                let rs = if is_sel { sel() } else { sty() };
+                Row::new(vec![
+                    Cell::from(format!("{}", i + 1)).style(dim()),
+                    Cell::from(shorten(&d.preview, 50)).style(rs),
+                    Cell::from(fmt_n(d.count)).style(rs),
+                    Cell::from(fmt_bytes(d.wasted_bytes)).style(if is_sel {
+                        sel()
+                    } else {
+                        warn()
+                    }),
+                    Cell::from(fmt_bytes(d.total_bytes)).style(rs),
+                ])
+                .height(1)
+                .style(rs)
+            })
+            .collect();
+
+        let title = format!(
+            "Top Duplicate Strings ({} groups)",
+            w.duplicate_strings.len()
+        );
+
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(5),
+                Constraint::Min(35),
+                Constraint::Length(9),
+                Constraint::Length(11),
+                Constraint::Length(11),
+            ],
+        )
+        .header(header_row([
+            "#",
+            "String Preview",
+            "Count",
+            "Wasted",
+            "Total",
+        ]))
+        .block(panel(&title))
+        .column_spacing(1);
+        f.render_widget(table, chunks[2]);
+        scroll_info(f, chunks[2], app.waste_sel + 1, w.duplicate_strings.len());
+    } else {
+        f.render_widget(
+            Paragraph::new("  No duplicate string groups found.")
+                .style(dim())
+                .block(panel("Duplicate Strings")),
+            chunks[2],
+        );
+    }
+}
+
+// ── TAB 6: Dominator Tree ────────────────────────────────────────────────────
+fn tab_domtree(f: &mut Frame, app: &App, area: Rect) {
+    if !app.has_dominators {
+        f.render_widget(no_dom_msg("Dominator Tree"), area);
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(5),
+        ])
+        .split(area);
+
+    // Breadcrumb bar
+    let crumb = format!(
+        "  {}  ({} children at this level)",
+        app.dom_breadcrumb(),
+        app.dom_children.len()
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled(crumb, Style::default().fg(TEAL))).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(BORDER))
+                .style(Style::default().bg(PANEL)),
+        ),
+        chunks[0],
+    );
+
+    // Children table
+    let total = app.state.get_summary().total_heap_size.max(1);
+    let vis = chunks[1].height.saturating_sub(5) as usize;
+
+    if app.dom_children.is_empty() {
+        f.render_widget(
+            Paragraph::new("\n  No children at this level — this is a leaf node.\n  Press Esc or 'o' to go back up.")
+                .style(dim()).block(panel("Dominator Tree")),
+            chunks[1],
+        );
+    } else {
+        let rows: Vec<Row> = app
+            .dom_children
+            .iter()
+            .enumerate()
+            .skip(app.dom_scroll)
+            .take(vis)
+            .map(|(i, obj)| {
+                let is_sel = i == app.dom_sel;
+                let pct = obj.retained_size as f64 / total as f64 * 100.0;
+                let rs = if is_sel { sel() } else { sty() };
+                let name = if obj.class_name.is_empty() {
+                    &obj.node_type
+                } else {
+                    &obj.class_name
+                };
+                let has_ch = app
+                    .state
+                    .get_children(obj.object_id)
+                    .map(|c| !c.is_empty())
+                    .unwrap_or(false);
+                let arrow = if has_ch { "▶" } else { " " };
+                Row::new(vec![
+                    Cell::from(format!("{}", i + 1)).style(dim()),
+                    Cell::from(arrow).style(if is_sel { sel() } else { acc() }),
+                    Cell::from(shorten(name, 38)).style(rs),
+                    Cell::from(shorten(&obj.node_type, 10)).style(dim()),
+                    Cell::from(if obj.object_id > 0 {
+                        format!("0x{:x}", obj.object_id)
+                    } else {
+                        "—".into()
+                    })
+                    .style(dim()),
+                    Cell::from(fmt_bytes(obj.shallow_size)).style(rs),
+                    Cell::from(fmt_bytes(obj.retained_size)).style(if is_sel {
+                        sel()
+                    } else {
+                        pct_style(pct)
+                    }),
+                    Cell::from(format!("{:.2}%", pct)).style(if is_sel {
+                        sel()
+                    } else {
+                        pct_style(pct)
+                    }),
+                ])
+                .height(1)
+                .style(rs)
+            })
+            .collect();
+
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(4),
+                Constraint::Length(2),
+                Constraint::Min(24),
+                Constraint::Length(10),
+                Constraint::Length(14),
+                Constraint::Length(11),
+                Constraint::Length(11),
+                Constraint::Length(8),
+            ],
+        )
+        .header(header_row([
+            "#",
+            "",
+            "Class",
+            "Type",
+            "Object ID",
+            "Shallow",
+            "Retained",
+            "% Heap",
+        ]))
+        .block(panel(
+            "Dominator Tree  [▶ = has children]  Enter/i = drill-in   Esc/o = up",
+        ))
+        .column_spacing(1);
+        f.render_widget(table, chunks[1]);
+        scroll_info(f, chunks[1], app.dom_sel + 1, app.dom_children.len());
+    }
+
+    // Mini help for this tab
+    let help_lines = vec![
+        Line::from(vec![
+            Span::styled("  Enter / i", acc()),
+            Span::styled(
+                "  Drill into selected object (follow dominator edge)",
+                dim(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Esc / o  ", acc()),
+            Span::styled("  Go back up to parent level", dim()),
+        ]),
+        Line::from(vec![
+            Span::styled("  ▶        ", acc()),
+            Span::styled("  Object has dominator children (can drill in)", dim()),
+        ]),
+        Line::from(vec![
+            Span::styled("  Depth: ", dim()),
+            Span::styled(
+                format!("{}", app.dom_stack.len()),
+                Style::default().fg(TEAL),
+            ),
+            Span::styled(
+                "  — retained size = shallow + sum of all exclusively-dominated objects",
+                dim(),
+            ),
+        ]),
+    ];
+    f.render_widget(
+        Paragraph::new(help_lines)
+            .block(panel("Navigation Help"))
+            .wrap(Wrap { trim: false }),
+        chunks[2],
+    );
+}
+
+// ── TAB 7: Help ──────────────────────────────────────────────────────────────
+fn tab_help(f: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::from(Span::styled(
+            "  hprof-tui  v0.2  —  HeapLens engine edition",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Navigation",
+            Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
+        )),
+        hr("Tab / → / l", "Next tab"),
+        hr("Shift+Tab / ← / h", "Previous tab"),
+        hr("1 – 6", "Jump to tab directly"),
+        hr("↑↓ / j k", "Scroll one row"),
+        hr("PgUp/PgDn / u d", "Scroll 10 rows"),
+        hr("g / Home", "Jump to top"),
+        hr("q / Ctrl-C", "Quit"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Actions",
+            Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
+        )),
+        hr("s", "Toggle histogram sort: retained ↔ shallow"),
+        hr("Enter / i", "Dominator Tree: drill into selected node"),
+        hr("Esc / o", "Dominator Tree: go back to parent level"),
+        hr("?", "This help screen"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Tabs",
+            Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
+        )),
+        hr("1  Overview", "Heap stats + top-15 retained bar chart"),
+        hr("2  Histogram", "All classes: shallow + retained, sortable"),
+        hr("3  Retained", "Classes ranked by retained + overhead ratio"),
+        hr("4  Leak Suspects", "Classes/objects retaining >10% heap"),
+        hr("5  Waste", "Dup strings, empty/over-alloc collections"),
+        hr(
+            "6  Dominator Tree",
+            "Interactive tree — drill into object graph",
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Engine",
+            Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "  Two-phase CSR parser + Lengauer-Tarjan dominators from HeapLens (Apache 2.0)",
+            dim(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Startup flags",
+            Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
+        )),
+        hr(
+            "(default)",
+            "Full analysis: Phase 1 + Phase 2 (dominators, retained sizes)",
+        ),
+        hr(
+            "--phase1-only",
+            "Fast startup — no dominators, no retained sizes",
+        ),
+    ];
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(panel("Help"))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+// ── Shared widgets ────────────────────────────────────────────────────────────
+
+fn no_dom_msg(title: &str) -> Paragraph<'static> {
+    Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Dominator tree not available.",
+            Style::default().fg(WARN),
+        )),
+        Line::from(Span::styled(
+            "  Re-run without --phase1-only to enable retained sizes and dominator tree.",
+            dim(),
+        )),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default().bg(PANEL))
+            .title(Span::styled(format!(" {} ", title), acc())),
+    )
+}
+
+fn scroll_info(f: &mut Frame, area: Rect, cur: usize, total: usize) {
+    if total == 0 {
+        return;
+    }
+    let txt = format!(" {}/{} ", cur, total);
+    let x = area.x + 2;
+    let y = area.y + area.height.saturating_sub(1);
+    if y < area.y + area.height {
+        f.render_widget(
+            Paragraph::new(Span::styled(txt, dim())),
+            Rect {
+                x,
+                y,
+                width: 20,
+                height: 1,
+            },
+        );
+    }
+}
+
+// ── Format helpers ────────────────────────────────────────────────────────────
+
+pub fn fmt_bytes(b: u64) -> String {
+    if b == 0 {
+        return "0 B".into();
+    }
+    const U: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let i = ((b as f64).log(1024.0).floor() as usize).min(U.len() - 1);
+    let v = b as f64 / 1024f64.powi(i as i32);
+    if i > 1 {
+        format!("{:.2} {}", v, U[i])
+    } else {
+        format!("{:.0} {}", v, U[i])
+    }
+}
+
+fn fmt_n(n: u64) -> String {
+    let s = n.to_string();
+    let mut r = String::new();
+    for (j, c) in s.chars().rev().enumerate() {
+        if j > 0 && j % 3 == 0 {
+            r.push(',');
+        }
+        r.push(c);
+    }
+    r.chars().rev().collect()
+}
+
+fn pct_style(pct: f64) -> Style {
+    if pct > 10.0 {
+        Style::default().fg(DANGER)
+    } else if pct > 3.0 {
+        Style::default().fg(WARN)
+    } else if pct > 0.5 {
+        acc()
+    } else {
+        dim()
+    }
+}
+
+fn severity_label(pct: f64) -> (&'static str, Color) {
+    if pct >= 30.0 {
+        ("HIGH", DANGER)
+    } else if pct >= 15.0 {
+        ("MED ", WARN)
+    } else {
+        ("LOW ", OK)
+    }
+}
+
+fn lkv(k: &str, v: String) -> ListItem<'static> {
+    ListItem::new(Line::from(vec![
+        Span::styled(format!("  {:<18}", k), dim()),
+        Span::styled(v, sty()),
+    ]))
+}
+
+fn badge(label: &str, col: Color, count: usize, desc: &str) -> ListItem<'static> {
+    ListItem::new(Line::from(vec![
+        Span::styled(
+            format!("  {} ", label),
+            Style::default().fg(col).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(count.to_string(), sty()),
+        Span::styled(format!("  {}", desc), dim()),
+    ]))
+}
+
+fn waste_li(label: &str, bytes: u64, groups: usize) -> ListItem<'static> {
+    ListItem::new(Line::from(vec![
+        Span::styled(format!("  {:<32}", label), dim()),
+        Span::styled(format!("{:>11}", fmt_bytes(bytes)), warn()),
+        if groups > 0 {
+            Span::styled(format!("  ({} groups)", groups), dim())
+        } else {
+            Span::raw("")
+        },
+    ]))
+}
+
+fn hr(key: &str, desc: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {:<24}", key), acc()),
+        Span::styled(desc.to_string(), sty()),
+    ])
+}
+
+fn retention_tip(class: &str) -> String {
+    let c = class.to_lowercase();
+    if c.contains("string") {
+        "Use String.intern() or byte[]; audit caches and ThreadLocals.".into()
+    } else if c.contains("statement") || c.contains("jdbc") {
+        "Close PreparedStatement in try-with-resources; limit statement cache.".into()
+    } else if c.contains("hashmap") || c.contains("map") {
+        "Bound map sizes; use WeakHashMap or Caffeine with eviction.".into()
+    } else if c.contains("list") || c.contains("array") {
+        "Enable pagination/virtualization; trim after bulk ops.".into()
+    } else if c.contains("thread") {
+        "Check ThreadLocals and pool sizes; call ThreadLocal.remove().".into()
+    } else if c.contains("byte[]") || c.contains("char[]") {
+        "Large byte/char arrays may be I/O buffers — flush and close streams.".into()
+    } else if c.contains("session") {
+        "Shorten session TTL; call session.invalidate() on logout.".into()
+    } else if c.contains("cache") {
+        "Set max size and TTL; use SoftReference or Caffeine.".into()
+    } else {
+        format!(
+            "Review static fields and long-lived caches holding {}.",
+            class
+        )
+    }
 }

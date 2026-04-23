@@ -1,19 +1,21 @@
 [package]
 name = "hprof-tui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "Terminal UI for Java/Android HPROF heap dump analysis — powered by the HeapLens engine"
 
 [[bin]]
 name = "hprof-tui"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = "=0.26.3"
-crossterm = "=0.27.0"
-anyhow = "=1.0.89"
-serde = { version = "=1.0.210", features = ["derive"] }
-serde_json = "=1.0.128"
-clap = { version = "=4.4.18", features = ["derive"] }
+# HeapLens production engine: two-phase CSR parser, Lengauer-Tarjan dominators,
+# HeapQL query engine, waste analysis, GC-root paths, object inspection
+hprof-analyzer = { git = "https://github.com/sachinkg12/heaplens", package = "hprof-analyzer", tag = "v1.0.19" }
 
-jvm-hprof = { path = "../heaplens-main/hprof-analyzer/crates/jvm-hprof" }
-memmap2 = "=0.9.5"
+ratatui   = "0.29"
+crossterm = "0.28"
+anyhow    = "1.0"
+serde_json = "1.0"
+clap      = { version = "4.0", features = ["derive"] }
+memmap2   = "0.9"
