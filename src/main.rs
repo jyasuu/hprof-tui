@@ -31,12 +31,10 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Build analysis (may take 10-120s depending on heap size)
     eprintln!("Loading {}…", cli.hprof_file);
     let app = App::new(&cli.hprof_file, cli.phase1_only)?;
     eprintln!("Analysis complete. Opening TUI…");
 
-    // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -45,13 +43,8 @@ fn main() -> Result<()> {
 
     let result = run(&mut terminal, app);
 
-    // Restore terminal
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 
     result
@@ -63,10 +56,14 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, mut app: App) -
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.code == KeyCode::Char('q')
-                    || (key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL))
+                    || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
                 {
-                    return Ok(());
+                    // Only quit if not in edit mode
+                    if app.query.mode == app::InputMode::Normal
+                        && app.inspector.mode == app::InputMode::Normal
+                    {
+                        return Ok(());
+                    }
                 }
                 events::handle_key(&mut app, key);
             }
